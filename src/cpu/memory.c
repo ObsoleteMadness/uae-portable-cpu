@@ -24,12 +24,28 @@ uae_test_device_t g_test_device = {0, 0, 0};
 bool g_musashi_mode = false;
 
 /* Weak default callbacks for Musashi API (overridden when using Musashi API) */
+#if defined(__GNUC__) || defined(__clang__)
 __attribute__((weak)) unsigned int m68k_read_memory_8(unsigned int address) { (void)address; return 0; }
 __attribute__((weak)) unsigned int m68k_read_memory_16(unsigned int address) { (void)address; return 0; }
 __attribute__((weak)) unsigned int m68k_read_memory_32(unsigned int address) { (void)address; return 0; }
 __attribute__((weak)) void m68k_write_memory_8(unsigned int address, unsigned int value) { (void)address; (void)value; }
 __attribute__((weak)) void m68k_write_memory_16(unsigned int address, unsigned int value) { (void)address; (void)value; }
 __attribute__((weak)) void m68k_write_memory_32(unsigned int address, unsigned int value) { (void)address; (void)value; }
+#elif defined(_MSC_VER)
+#pragma comment(linker, "/alternatename:m68k_read_memory_8=default_m68k_read_memory_8")
+#pragma comment(linker, "/alternatename:m68k_read_memory_16=default_m68k_read_memory_16")
+#pragma comment(linker, "/alternatename:m68k_read_memory_32=default_m68k_read_memory_32")
+#pragma comment(linker, "/alternatename:m68k_write_memory_8=default_m68k_write_memory_8")
+#pragma comment(linker, "/alternatename:m68k_write_memory_16=default_m68k_write_memory_16")
+#pragma comment(linker, "/alternatename:m68k_write_memory_32=default_m68k_write_memory_32")
+
+unsigned int default_m68k_read_memory_8(unsigned int address) { (void)address; return 0; }
+unsigned int default_m68k_read_memory_16(unsigned int address) { (void)address; return 0; }
+unsigned int default_m68k_read_memory_32(unsigned int address) { (void)address; return 0; }
+void default_m68k_write_memory_8(unsigned int address, unsigned int value) { (void)address; (void)value; }
+void default_m68k_write_memory_16(unsigned int address, unsigned int value) { (void)address; (void)value; }
+void default_m68k_write_memory_32(unsigned int address, unsigned int value) { (void)address; (void)value; }
+#endif
 
 /* Dummy Bank Handlers (Default / Unmapped) */
 static uae_u32 REGPARAM3 dummy_lget(uaecptr addr) REGPARAM {
@@ -319,12 +335,16 @@ void memory_reset(void) {
 
 void memory_uninit(void) {
     for (int i = 0; i < MEMORY_BANKS; i++) {
-        if (mem_banks[i] && mem_banks[i] != &dummy_bank &&
-            mem_banks[i] != &musashi_bridge_bank &&
-            mem_banks[i] != &test_device_bank) {
-            if (mem_banks[i]->flags & ABFLAG_RAM) {
-                free(mem_banks[i]);
+        addrbank *bank = mem_banks[i];
+        if (bank && bank != &dummy_bank &&
+            bank != &musashi_bridge_bank &&
+            bank != &test_device_bank) {
+            for (int j = i + 1; j < MEMORY_BANKS; j++) {
+                if (mem_banks[j] == bank) {
+                    mem_banks[j] = &dummy_bank;
+                }
             }
+            free(bank);
         }
         mem_banks[i] = &dummy_bank;
     }
@@ -405,10 +425,29 @@ int memory_map_custom(uint32_t start_addr, uint32_t size,
 void memory_unmap(uint32_t start_addr, uint32_t size) {
     int start_bank = (start_addr >> 16) & 0xFFFF;
     int num_banks = ((size + 0xFFFF) >> 16);
+    addrbank *bank_to_free = NULL;
+    if (num_banks > 0) {
+        int idx = start_bank & 0xFFFF;
+        addrbank *b = mem_banks[idx];
+        if (b && b != &dummy_bank && b != &musashi_bridge_bank && b != &test_device_bank) {
+            bank_to_free = b;
+        }
+    }
     for (int i = 0; i < num_banks; i++) {
         int idx = (start_bank + i) & 0xFFFF;
         mem_banks[idx] = &dummy_bank;
         ce_cachable[idx] = 0;
         ce_banktype[idx] = CE_MEMBANK_NONE;
+    }
+    if (bank_to_free) {
+        for (int i = 0; i < MEMORY_BANKS; i++) {
+            if (mem_banks[i] == bank_to_free) {
+                bank_to_free = NULL;
+                break;
+            }
+        }
+        if (bank_to_free) {
+            free(bank_to_free);
+        }
     }
 }

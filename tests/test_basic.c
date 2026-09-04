@@ -5,6 +5,17 @@
 #include "m68k.h"
 #include "uae_cpu.h"
 
+#if defined(_MSC_VER)
+#define bswap_16(x) _byteswap_ushort(x)
+#define bswap_32(x) _byteswap_ulong(x)
+#elif defined(__GNUC__) || defined(__clang__)
+#define bswap_16(x) __builtin_bswap16(x)
+#define bswap_32(x) __builtin_bswap32(x)
+#else
+#define bswap_16(x) ((((x) >> 8) & 0xff) | (((x) & 0xff) << 8))
+#define bswap_32(x) ((((x) >> 24) & 0xff) | (((x) >> 8) & 0xff00) | (((x) & 0xff00) << 8) | (((x) & 0xff) << 24))
+#endif
+
 static uint8_t g_ram[0x100000];
 
 unsigned int m68k_read_memory_8(unsigned int address) {
@@ -122,15 +133,15 @@ static void test_uae_cpu_api(void) {
 
     uae_cpu_map_ram(cpu, 0x00000000, 0x100000, ram);
 
-    *(uint32_t *)&ram[0x0000] = __builtin_bswap32(0x00080000);
-    *(uint32_t *)&ram[0x0004] = __builtin_bswap32(0x00002000);
+    *(uint32_t *)&ram[0x0000] = bswap_32(0x00080000);
+    *(uint32_t *)&ram[0x0004] = bswap_32(0x00002000);
 
     uint32_t pc = 0x2000;
-    *(uint16_t *)&ram[pc + 0] = __builtin_bswap16(0x243C); // MOVE.L #imm, D2
-    *(uint16_t *)&ram[pc + 2] = __builtin_bswap16(0xCAFE);
-    *(uint16_t *)&ram[pc + 4] = __builtin_bswap16(0xBABE);
-    *(uint16_t *)&ram[pc + 6] = __builtin_bswap16(0xE19A); // ROL.L #8, D2 -> 0xFEBABECA
-    *(uint16_t *)&ram[pc + 8] = __builtin_bswap16(0x4E71); // NOP
+    *(uint16_t *)&ram[pc + 0] = bswap_16(0x243C); // MOVE.L #imm, D2
+    *(uint16_t *)&ram[pc + 2] = bswap_16(0xCAFE);
+    *(uint16_t *)&ram[pc + 4] = bswap_16(0xBABE);
+    *(uint16_t *)&ram[pc + 6] = bswap_16(0xE19A); // ROL.L #8, D2 -> 0xFEBABECA
+    *(uint16_t *)&ram[pc + 8] = bswap_16(0x4E71); // NOP
 
     uae_cpu_reset(cpu);
     assert(uae_cpu_get_pc(cpu) == 0x2000);
