@@ -317,12 +317,12 @@ static void set_last_access_ipl_prev(uae_u32 flags)
 }
 
 
-NORETURN static void term (void)
+static NORETURN void term (void)
 {
 	out("Abort!\n");
 	abort();
 }
-NORETURN static void term_err (const char *err)
+static NORETURN void term_err (const char *err)
 {
 	out("%s\n", err);
 	term();

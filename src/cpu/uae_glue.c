@@ -181,11 +181,8 @@ void BusError68000(uaecptr addr, int ws, int fc)
 void do_cycles_ce(int cycles) { currcycle += cycles; }
 void do_cycles_ce020(int cycles) { currcycle += cycles; }
 void do_cycles_ce_hatari_blitter(int cycles) { currcycle += cycles; }
-void do_cycles_slow(int cycles) { currcycle += cycles; }
-void do_cycles_normal(int cycles) { currcycle += cycles; }
 bool is_cycle_ce(uaecptr addr) { (void)addr; return false; }
 
-bool fp_init_native(void) { return true; }
 void fpux_restore(int *status) { (void)status; }
 
 evt_t currcycle = 0;

@@ -19,7 +19,13 @@
 #include <stdarg.h>
 
 #ifndef NORETURN
+#if defined(_MSC_VER)
+#define NORETURN __declspec(noreturn)
+#elif defined(__GNUC__) || defined(__clang__)
 #define NORETURN __attribute__((noreturn))
+#else
+#define NORETURN
+#endif
 #endif
 #ifndef NOWARN_UNUSED
 #define NOWARN_UNUSED(x) x
@@ -66,6 +72,9 @@
 #define strncasecmp _strnicmp
 #define stricmp _stricmp
 #define strnicmp _strnicmp
+#ifndef strdup
+#define strdup _strdup
+#endif
 #else
 #define strnicmp strncasecmp
 #define stricmp strcasecmp
