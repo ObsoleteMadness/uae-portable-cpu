@@ -63,7 +63,7 @@ uae-portable-cpu/
 
 ### Prerequisites
 - CMake 3.16 or later
-- C/C++ compiler (GCC or Clang with C11 and C++17 support)
+- C/C++ compiler (GCC, Clang, or MSVC with C11 and C++17 support)
 
 ### Build Instructions
 
@@ -76,6 +76,42 @@ cmake --build build -j$(nproc 2>/dev/null || sysctl -n hw.ncpu)
 
 # Run test suite
 ctest --test-dir build --output-on-failure
+
+# Install library and CMake config files
+cmake --install build --prefix /usr/local
+```
+
+---
+
+## Package Manager & CMake Integration
+
+### Using via CMake `find_package`
+
+Once installed or added via vcpkg, consume `uae-portable-cpu` in your `CMakeLists.txt`:
+
+```cmake
+find_package(uae-portable-cpu CONFIG REQUIRED)
+
+add_executable(my_emulator main.c)
+target_link_libraries(my_emulator PRIVATE uae-portable-cpu::uaecpu)
+```
+
+### Using via vcpkg Manifest Mode (`vcpkg.json`)
+
+Add `uae-portable-cpu` to your project's `vcpkg.json`:
+
+```json
+{
+  "dependencies": [
+    "uae-portable-cpu"
+  ]
+}
+```
+
+Or consume with an overlay port pointing to `ports/uae-portable-cpu`:
+
+```bash
+vcpkg install --overlay-ports=ports/uae-portable-cpu uae-portable-cpu
 ```
 
 ---

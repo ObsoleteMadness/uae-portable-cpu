@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build-and-test:
+    name: Build & Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ ubuntu-latest, macos-latest, windows-latest ]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure CMake
+        run: >
+          cmake -B build
+          -DCMAKE_BUILD_TYPE=Release
+          -DENABLE_TESTS=ON
+
+      - name: Build
+        run: cmake --build build --config Release -j
+
+      - name: Run CTest
+        run: ctest --test-dir build -C Release --output-on-failure
+
+      - name: Test CMake Install
+        run: cmake --install build --config Release --prefix install_test

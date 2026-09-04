@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(uae_portable_cpu C CXX)
+project(uae_portable_cpu VERSION 0.1.0 LANGUAGES C CXX)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_CXX_STANDARD 17)
@@ -8,13 +8,8 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 option(BUILD_SHARED_LIBS "Build shared libraries" OFF)
 option(ENABLE_TESTS "Build tests" ON)
 
-include_directories(
-    ${CMAKE_CURRENT_SOURCE_DIR}
-    ${CMAKE_CURRENT_SOURCE_DIR}/include
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/cpu
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/cpu/softfloat
-    ${CMAKE_CURRENT_BINARY_DIR}
-)
+include(GNUInstallDirs)
+include(CMakePackageConfigHelpers)
 
 # Generator tools
 add_executable(build68k
@@ -93,28 +88,69 @@ if(CMAKE_C_COMPILER_ID MATCHES "Clang|AppleClang|GNU")
     set_source_files_properties(src/cpu/newcpu.c src/cpu/newcpu_common.c src/cpu/cpummu.c src/cpu/cpummu030.c PROPERTIES COMPILE_FLAGS "-Wno-unused-variable -Wno-unused-function -fwrapv")
 endif()
 
-add_library(uaecpu STATIC ${CORE_SOURCES})
+add_library(uaecpu ${CORE_SOURCES})
+add_library(uae-portable-cpu::uaecpu ALIAS uaecpu)
+
 target_include_directories(uaecpu PUBLIC
-    ${CMAKE_CURRENT_SOURCE_DIR}/include
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/cpu
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/cpu/softfloat
-    ${CMAKE_CURRENT_BINARY_DIR}
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/cpu>
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/cpu/softfloat>
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}>
+    $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
+)
+
+if(NOT MSVC)
+    target_link_libraries(uaecpu PUBLIC m)
+endif()
+
+# Installation and exports
+install(TARGETS uaecpu
+    EXPORT uae-portable-cpu-targets
+    ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+)
+
+install(DIRECTORY include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+
+install(EXPORT uae-portable-cpu-targets
+    FILE uae-portable-cpu-targets.cmake
+    NAMESPACE uae-portable-cpu::
+    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/uae-portable-cpu
+)
+
+write_basic_package_version_file(
+    "${CMAKE_CURRENT_BINARY_DIR}/uae-portable-cpu-config-version.cmake"
+    VERSION ${PROJECT_VERSION}
+    COMPATIBILITY SameMajorVersion
+)
+
+configure_package_config_file(
+    "${CMAKE_CURRENT_SOURCE_DIR}/cmake/uae-portable-cpu-config.cmake.in"
+    "${CMAKE_CURRENT_BINARY_DIR}/uae-portable-cpu-config.cmake"
+    INSTALL_DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/uae-portable-cpu
+)
+
+install(FILES
+    "${CMAKE_CURRENT_BINARY_DIR}/uae-portable-cpu-config.cmake"
+    "${CMAKE_CURRENT_BINARY_DIR}/uae-portable-cpu-config-version.cmake"
+    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/uae-portable-cpu
 )
 
 if(ENABLE_TESTS)
     enable_testing()
 
     add_executable(test_basic tests/test_basic.c)
-    target_link_libraries(test_basic PRIVATE uaecpu m)
+    target_link_libraries(test_basic PRIVATE uaecpu)
 
     add_executable(test_musashi_suite tests/test_musashi_suite.c)
-    target_link_libraries(test_musashi_suite PRIVATE uaecpu m)
+    target_link_libraries(test_musashi_suite PRIVATE uaecpu)
 
     add_executable(test_m68k_rs_suite tests/test_m68k_rs_suite.c)
-    target_link_libraries(test_m68k_rs_suite PRIVATE uaecpu m)
+    target_link_libraries(test_m68k_rs_suite PRIVATE uaecpu)
 
     add_executable(test_uae_cpu tests/test_uae_cpu.c)
-    target_link_libraries(test_uae_cpu PRIVATE uaecpu m)
+    target_link_libraries(test_uae_cpu PRIVATE uaecpu)
 
     add_test(NAME test_basic COMMAND test_basic)
     add_test(NAME test_uae_cpu COMMAND test_uae_cpu)

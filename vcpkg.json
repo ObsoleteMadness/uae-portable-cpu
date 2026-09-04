@@ -1,0 +1,9 @@
+{
+  "$schema": "https://raw.githubusercontent.com/microsoft/vcpkg-tool/main/docs/vcpkg.schema.json",
+  "name": "uae-portable-cpu",
+  "version-semver": "0.1.0",
+  "description": "Standalone portable Motorola 680x0 CPU core library with Musashi and context APIs, SoftFloat FPU, and JIT",
+  "homepage": "https://github.com/ObsoleteMadness/uae-portable-cpu",
+  "license": "GPL-2.0-or-later",
+  "dependencies": []
+}

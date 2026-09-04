@@ -8,7 +8,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
-#include <dirent.h>
+#include "portable_dirent.h"
 
 unsigned int m68k_read_disassembler_16(unsigned int address) {
     (void)address;

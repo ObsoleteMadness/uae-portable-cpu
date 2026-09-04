@@ -1,0 +1,4 @@
+@PACKAGE_INIT@
+
+include("${CMAKE_CURRENT_LIST_DIR}/uae-portable-cpu-targets.cmake")
+check_required_components(uae-portable-cpu)
