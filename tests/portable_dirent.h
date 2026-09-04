@@ -4,8 +4,24 @@
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
-#include <string.h>
 #include <stdlib.h>
+#include <sys/stat.h>
+
+#ifndef S_IFMT
+#define S_IFMT _S_IFMT
+#endif
+#ifndef S_IFDIR
+#define S_IFDIR _S_IFDIR
+#endif
+#ifndef S_IFREG
+#define S_IFREG _S_IFREG
+#endif
+#ifndef S_ISDIR
+#define S_ISDIR(m) (((m) & S_IFMT) == S_IFDIR)
+#endif
+#ifndef S_ISREG
+#define S_ISREG(m) (((m) & S_IFMT) == S_IFREG)
+#endif
 
 struct dirent {
     char d_name[MAX_PATH];
