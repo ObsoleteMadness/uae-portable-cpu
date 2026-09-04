@@ -61,8 +61,15 @@
 
 #define STATIC_INLINE static inline
 
+#ifdef _WIN32
+#define strcasecmp _stricmp
+#define strncasecmp _strnicmp
+#define stricmp _stricmp
+#define strnicmp _strnicmp
+#else
 #define strnicmp strncasecmp
 #define stricmp strcasecmp
+#endif
 
 #define xmalloc(type, num) ((type *)malloc(sizeof(type) * (num)))
 #define xcalloc(type, num) ((type *)calloc(num, sizeof(type)))

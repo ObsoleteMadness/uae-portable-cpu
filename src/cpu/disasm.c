@@ -9,7 +9,6 @@
 #include "fpp.h"
 #include "debugmem.h"
 #include "disasm.h"
-#include "profile.h"
 
 #define DIASM_BUFFER_SIZE 2000
 

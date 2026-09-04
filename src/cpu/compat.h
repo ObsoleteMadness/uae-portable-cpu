@@ -15,7 +15,10 @@
 #include <ctype.h>
 #include "uae/string.h"
 
+#ifndef _WIN32
 #define strnicmp strncasecmp
+#define stricmp strcasecmp
+#endif
 
 #define console_out printf
 #define console_out_f(...) printf(__VA_ARGS__)
