@@ -4,7 +4,10 @@
 
 #ifdef NATMEM_OFFSET
 #ifdef _WIN32 // %%% BRIAN KING WAS HERE %%%
-#include <winbase.h>
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
 #else
 #ifndef __USE_GNU
 #define __USE_GNU

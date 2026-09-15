@@ -546,7 +546,11 @@ static inline int end_block(uae_u32 opcode)
 }
 
 #ifdef _WIN32
-LONG WINAPI EvalException(LPEXCEPTION_POINTERS info);
+/* Declared without <windows.h> types: this header is also included from C
+ * files that do not include windows.h. Matches LONG WINAPI (defined in
+ * exception_handler.cpp) with LPEXCEPTION_POINTERS. */
+struct _EXCEPTION_POINTERS;
+long __stdcall EvalException(struct _EXCEPTION_POINTERS *info);
 #if defined(_MSC_VER) && !defined(NO_WIN32_EXCEPTION_HANDLER)
 #ifdef _WIN64
 /* Structured exception handling is table based for Windows x86-64, so
