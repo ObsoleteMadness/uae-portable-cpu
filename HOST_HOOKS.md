@@ -260,7 +260,7 @@ With `jit_enabled` (see the [README](README.md#3-jit-compiler)), every hook keep
 | `dbf_spin` | While the hook is installed, `DBF Dn` is routed to its C handler so the hook is offered; installing or removing it rebuilds the tables |
 | `exception` | Fires as in the interpreter; `fault_pc` comes from the instruction being dispatched |
 | `get_irq`, `uae_cpu_signal_irq()` | Interrupts are taken at block boundaries |
-| `uae_cpu_raise_bus_error()` | Aborts the instruction from inside translated code through the JIT's bus-error recovery. Exception: with `jit_direct_memory` on x86-64, a handler reached through fault recovery (an inlined access that hit an inaccessible part of the window) cannot raise one, and the call is ignored |
+| `uae_cpu_raise_bus_error()` | Aborts the instruction from inside translated code through the JIT's bus-error recovery. Exception: with `jit_direct_memory` on x86-64 and Windows ARM64, a handler reached through fault recovery (an inlined access that hit an inaccessible part of the window) cannot raise one, and the call is ignored |
 | Memory callbacks | Called for every access by default. With `jit_direct_memory`, accesses that profiling saw in `UAE_MEM_JIT_DIRECT` RAM are inlined and never reach a callback |
 | `instruction` hook | Only called for code that runs on the interpreter |
 
@@ -284,9 +284,11 @@ With `jit_enabled` (see the [README](README.md#3-jit-compiler)), every hook keep
 - The JIT translates only from the flat window set with
   `uae_cpu_set_jit_memory_base()`. Direct memory access (`jit_direct_memory`)
   needs that window to cover the guest address space, and recovers faults in
-  it only on x86-64.
+  it only on x86-64 and Windows ARM64.
 - With `jit_direct_memory` on x86-64 the library installs a SIGSEGV (and, on
   macOS, SIGBUS) handler the first time it builds its tables. Faults outside
   translated code are passed to the handler that was installed before it.
+  On Windows (x64 and ARM64) it adds a vectored exception handler instead,
+  which passes on every exception it does not handle.
 - `uae_cpu_raise_bus_error()` only takes effect inside `uae_cpu_execute()`,
   `uae_cpu_step()` or `m68k_execute()`.

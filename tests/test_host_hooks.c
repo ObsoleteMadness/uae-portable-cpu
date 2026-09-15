@@ -525,8 +525,9 @@ static void run_until(uint32_t pc)
  *   - a region flagged UAE_MEM_JIT_DIRECT whose host pointer is outside the
  *     JIT window must still be read through its handler;
  *   - a device read by a loop is called once per access;
- *   - x86-64 only: a translated read profiled against RAM that later hits the
- *     device faults in the window and is completed through the handler.
+ *   - x86-64 and Windows ARM64 (the JITs with fault recovery): a translated
+ *     read profiled against RAM that later hits the device faults in the
+ *     window and is completed through the handler.
  */
 static void test_direct_memory(void)
 {
@@ -577,8 +578,8 @@ static void test_direct_memory(void)
     CHECK((reg(UAE_REG_D2) & 0xFFFF) == ((0x4000 * 0x0102) & 0xFFFF));
     uae_cpu_unmap_memory(s_cpu, DEVICE_ADDR, 0x10000);
 
-#if defined(__x86_64__) || defined(_M_X64)
-    printf("[*] translated RAM read moved onto a device (x86-64 fault recovery)\n");
+#if defined(__x86_64__) || defined(_M_X64) || (defined(_WIN32) && defined(_M_ARM64))
+    printf("[*] translated RAM read moved onto a device (fault recovery)\n");
     boot(UAE_CPU_TYPE_68020, ram_then_device, sizeof(ram_then_device) / sizeof(ram_then_device[0]));
     uae_cpu_map_custom(s_cpu, DEVICE_ADDR, 0x10000, cnt_r8, cnt_r16, cnt_r32,
                        dev_w8, dev_w16, dev_w32, NULL);

@@ -1273,6 +1273,8 @@ static LONG CALLBACK windows_arm64_jit_exception_handler(PEXCEPTION_POINTERS inf
 				write_log(_T("JIT: Windows ARM64 dummy_bank store at %08x ignored\n"), amiga_addr);
 			}
 		} else if (transfer_type == TYPE_LOAD) {
+			/* Compiled-code register state: region handlers must not unwind. */
+			g_jit_in_fault_recovery = true;
 			uae_u32 newval = get_reg_w(rd);
 			switch (transfer_size) {
 			case SIZE_BYTE:
@@ -1288,7 +1290,9 @@ static LONG CALLBACK windows_arm64_jit_exception_handler(PEXCEPTION_POINTERS inf
 				break;
 			}
 			set_reg_w(rd, newval);
+			g_jit_in_fault_recovery = false;
 		} else {
+			g_jit_in_fault_recovery = true;
 			const uae_u32 regval = get_reg_w(rd);
 			switch (transfer_size) {
 			case SIZE_BYTE:
@@ -1303,6 +1307,7 @@ static LONG CALLBACK windows_arm64_jit_exception_handler(PEXCEPTION_POINTERS inf
 			default:
 				break;
 			}
+			g_jit_in_fault_recovery = false;
 		}
 
 		info->ContextRecord->Pc += 4;

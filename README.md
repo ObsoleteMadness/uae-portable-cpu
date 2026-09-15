@@ -90,7 +90,7 @@ cmake --install build --prefix /usr/local
 | :--- | :--- | :--- |
 | `ENABLE_TESTS` | `ON` | Build the test executables and register them with CTest |
 | `UAE_CPU_MUSASHI_API` | `ON` | Build the Musashi-compatible `m68k_*` API. Turn off when the host also links Musashi |
-| `UAE_CPU_JIT` | `AUTO` | Build the JIT compiler. `AUTO` enables it on AArch64 and x86-64 with GCC or Clang; `ON` fails the configure elsewhere; `OFF` builds the interpreter only |
+| `UAE_CPU_JIT` | `AUTO` | Build the JIT compiler. `AUTO` enables it on AArch64 and x86-64 with GCC, Clang or MSVC; `ON` fails the configure elsewhere; `OFF` builds the interpreter only |
 | `UAE_CPU_ISOLATE_SYMBOLS` | `OFF` | Also build `uaecpu_isolated`, a static library exporting only the public API (Apple ld or GNU ld + objcopy; not MSVC). Adds the `isolated_link` test |
 
 ---
@@ -289,8 +289,8 @@ How it behaves:
 - **Flat code window.** Translated code derives the 68k PC from host pointers, so the JIT only translates code in regions mapped with `uae_cpu_map_memory()` whose host pointer equals `base + guest address`. Declare that base with `uae_cpu_set_jit_memory_base()`. A RAM buffer mapped at guest 0 qualifies, as does one reservation covering the whole address space. Code anywhere else (custom devices, Musashi-style callbacks) runs through the interpreter inside the JIT dispatcher.
 - **Memory access** from translated code goes through the region handlers by default, so custom devices, ROM write protection and `uae_cpu_raise_bus_error()` behave as in the interpreter.
 - **Direct memory access** (`jit_direct_memory`). Translated code reads and writes RAM inline as `base + address` instead of calling a handler. This is how WinUAE and Amiberry run fast, and it is several times faster than handler calls. It applies to regions mapped with `UAE_MEM_JIT_DIRECT` whose host pointer is `base + start`; ROM writes still go through the handler. Each block is profiled in the interpreter before it is compiled: accesses that touched only such regions are inlined, all others keep the handler call. An instruction that later reaches a different address still goes to `base + address`, so the window must cover every address translated code can reach. In practice that means one 4 GB reservation with RAM, ROM and video memory committed at their guest addresses and the rest left inaccessible:
-  - on x86-64 a fault in an inaccessible part of the window is recovered: the access completes through the region's handler and the block is profiled again. A handler reached this way cannot raise a bus error;
-  - on AArch64 there is no recovery; such a fault reaches the host's SIGSEGV/SIGBUS handler.
+  - on x86-64 (every OS) and on Windows ARM64, a fault in an inaccessible part of the window is recovered: the access completes through the region's handler and the block is profiled again. A handler reached this way cannot raise a bus error;
+  - on AArch64 Linux and macOS there is no recovery; such a fault reaches the host's SIGSEGV/SIGBUS handler.
   `UAE_MEM_JIT_UNSAFE_BURST` on any region switches to a conservative mode: blocks that touch handler-backed memory are interpreted, and on x86-64 translated accesses use the handlers again.
 - **JIT FPU** (`jit_fpu`). Translates FPU instructions too, as WinUAE's JIT FPU does. It needs `jit_direct_memory` and the host-double FPU backend (`fpu_softfloat = false`): translated FPU code works on host doubles and moves values through the memory base. FPU instructions that profiling saw touch handler-backed memory stay on the interpreter. Results have double, not 80-bit extended, precision.
 - **Cache gating.** WinUAE only translates while the guest has enabled the CPU cache through `CACR`. By default the library translates whenever the JIT is on. Set `jit_follow_cacr` to restore the WinUAE behaviour.
@@ -298,9 +298,9 @@ How it behaves:
 - **Hooks.** Every host hook works under the JIT; see [HOST_HOOKS.md](HOST_HOOKS.md#under-the-jit).
 - **Self-modifying code.** Call `uae_cpu_invalidate_code()` after the host writes guest code; translated blocks are also checksummed before reuse.
 
-Verification: the m68k-rs fixtures give the same per-fixture results with the interpreter, the JIT and the JIT with direct memory access on the same memory map. `host_hooks_jit` and `host_hooks_jit_direct` check translated byte/word/long access against a C reference. The direct variant also checks that devices and regions outside the window keep their handlers, and exercises the x86-64 fault recovery. `uae_cpu_bench` measures throughput; see [Benchmarks](#benchmarks).
+Verification: the m68k-rs fixtures give the same per-fixture results with the interpreter, the JIT and the JIT with direct memory access on the same memory map. `host_hooks_jit` and `host_hooks_jit_direct` check translated byte/word/long access against a C reference. The direct variant also checks that devices and regions outside the window keep their handlers, and exercises fault recovery on x86-64 and Windows ARM64. CI builds and tests the JIT with GCC and Clang on Linux and macOS, and with MSVC (x64 and ARM64) and MinGW-w64 on Windows. `uae_cpu_bench` measures throughput; see [Benchmarks](#benchmarks).
 
-Limitations: no JIT with MSVC; direct memory access needs a window covering the guest address space and has no fault recovery on AArch64; the JIT FPU computes in double precision; one CPU per process.
+Limitations: direct memory access needs a window covering the guest address space and has no fault recovery on AArch64 Linux and macOS; the JIT FPU computes in double precision; one CPU per process.
 
 #### Benchmarks
 
