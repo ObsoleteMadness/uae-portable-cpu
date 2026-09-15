@@ -99,7 +99,8 @@ typedef struct {
     uae_cpu_type_t cpu_type;
     uae_fpu_type_t fpu_type;
     uae_mmu_type_t mmu_type;
-    bool fpu_softfloat;      /* true = use SoftFloat, false = host native */
+    bool fpu_softfloat;      /* true = SoftFloat (80-bit extended precision); false = host doubles
+                              * (faster, double precision; required for jit_fpu) */
     bool address_space_24;   /* true = 24-bit addressing (e.g. 68000, 68EC020) */
     int timing_mode;         /* 0 = fast/standard, 1 = prefetch, 2 = cycle-exact */
     bool jit_enabled;        /* true = run 68020+ code through the JIT when the library has one */
@@ -110,6 +111,10 @@ typedef struct {
     bool jit_direct_memory;  /* true = translated code reads and writes UAE_MEM_JIT_DIRECT regions
                               * inline through the JIT memory base instead of calling the region
                               * handlers; see uae_cpu_set_jit_memory_base() */
+    bool jit_fpu;            /* true = also translate FPU instructions (WinUAE "JIT FPU"). Takes
+                              * effect only with jit_enabled, jit_direct_memory, an FPU and
+                              * fpu_softfloat = false: translated FPU code works on host doubles
+                              * and moves values through the JIT memory base */
 } uae_cpu_config_t;
 
 /* Memory Read/Write Callbacks for custom mapped devices */

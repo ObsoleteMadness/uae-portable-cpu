@@ -125,7 +125,8 @@ extern bool g_jit_follow_cacr;
 extern bool g_jit_in_fault_recovery;
 
 /* Applies the uae_cpu_config_t JIT settings before the CPU tables are rebuilt. */
-void uae_host_configure_jit(bool enabled, uint32_t cache_kb, bool follow_cacr, bool direct_memory);
+void uae_host_configure_jit(bool enabled, uint32_t cache_kb, bool follow_cacr, bool direct_memory,
+                            bool jit_fpu);
 
 /* True when compiled code must call this opcode's C handler (host hooks need it). */
 int uae_host_jit_must_interpret(uint32_t opcode);

@@ -64,14 +64,20 @@ void uae_cpu_set_config(uae_cpu_t *cpu, const uae_cpu_config_t *config) {
     currprefs.address_space_24 = config->address_space_24;
     currprefs.cpu_compatible = (config->timing_mode >= 1);
     currprefs.cpu_cycle_exact = (config->timing_mode >= 2);
-    currprefs.fpu_mode = config->fpu_softfloat ? 0 : 1;
+    /* fpp.c convention: > 0 = SoftFloat, 0 = host doubles. */
+    int fpu_mode = config->fpu_softfloat ? 1 : 0;
+    bool fpu_backend_changed = currprefs.fpu_mode != fpu_mode;
+    currprefs.fpu_mode = fpu_mode;
     uae_host_configure_jit(config->jit_enabled, config->jit_cache_size, config->jit_follow_cacr,
-                           config->jit_direct_memory);
+                           config->jit_direct_memory, config->jit_fpu);
     g_unmapped_bus_error = config->unmapped_bus_error;
 
     changed_prefs = currprefs;
     fixup_cpu(&currprefs);
     init_m68k();
+    /* The FPU backend is chosen by fpu_reset(); switching it resets the FPU. */
+    if (fpu_backend_changed)
+        fpu_reset();
 }
 
 void uae_cpu_get_config(uae_cpu_t *cpu, uae_cpu_config_t *config) {

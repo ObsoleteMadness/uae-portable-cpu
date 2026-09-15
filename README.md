@@ -10,7 +10,7 @@ All Amiga- and Atari ST-specific hardware dependencies, custom chipset logic, fl
 
 - **Broad CPU Support**: Full cycle-accurate emulation for Motorola 68000, 68010, 68EC020, 68020, 68EC030, 68030, 68EC040, 68LC040, 68040, and 68060.
 - **FPU & MMU Emulation**:
-  - IEEE-754 compliant SoftFloat FPU supporting 68881, 68882, and integrated 68040/060 FPUs.
+  - IEEE-754 compliant SoftFloat FPU supporting 68881, 68882, and integrated 68040/060 FPUs. A faster host-double backend (`fpu_softfloat = false`) gives up 80-bit precision; the JIT FPU uses it.
   - 68030 and 68040 MMU translation support.
 - **JIT Compilation**: ARM64 (AArch64) and x86-64 dynamic translation for 68020+ code, built by default on supported hosts. See [JIT Compiler](#3-jit-compiler).
 - **Hardware Agnostic**:
@@ -135,7 +135,7 @@ All test suites pass via `ctest` (12 with the JIT built):
 | Test Target | Description | Pass Rate | Status |
 | :--- | :--- | :--- | :--- |
 | **`test_basic`** | Musashi API & Context API smoke tests | 100% | **PASSED** |
-| **`test_uae_cpu`** | Native UAE tests (68000–68060 switching, bitfields, CAS, SoftFloat `FMUL.D`, context isolation) | 100% | **PASSED** |
+| **`test_uae_cpu`** | Native UAE tests (68000–68060 switching, bitfields, CAS, SoftFloat `FMUL.D`, shared handles) | 100% | **PASSED** |
 | **`musashi_68000`** | Musashi 68000 test suite | 55 / 60 (91.7%)* | **PASSED** |
 | **`musashi_68040`** | Musashi 68040 test suite | 16 / 18 (88.9%)* | **PASSED** |
 | **`m68k_rs_coverage`** | `m68k-rs` comprehensive instruction coverage | 25 / 25 (100%) | **PASSED** |
@@ -292,6 +292,7 @@ How it behaves:
   - on x86-64 a fault in an inaccessible part of the window is recovered: the access completes through the region's handler and the block is profiled again. A handler reached this way cannot raise a bus error;
   - on AArch64 there is no recovery; such a fault reaches the host's SIGSEGV/SIGBUS handler.
   `UAE_MEM_JIT_UNSAFE_BURST` on any region switches to a conservative mode: blocks that touch handler-backed memory are interpreted, and on x86-64 translated accesses use the handlers again.
+- **JIT FPU** (`jit_fpu`). Translates FPU instructions too, as WinUAE's JIT FPU does. It needs `jit_direct_memory` and the host-double FPU backend (`fpu_softfloat = false`): translated FPU code works on host doubles and moves values through the memory base. FPU instructions that profiling saw touch handler-backed memory stay on the interpreter. Results have double, not 80-bit extended, precision.
 - **Cache gating.** WinUAE only translates while the guest has enabled the CPU cache through `CACR`. By default the library translates whenever the JIT is on. Set `jit_follow_cacr` to restore the WinUAE behaviour.
 - **Execute budget.** `uae_cpu_execute(cpu, cycles)` stops translated code when the budget is spent. `uae_cpu_get_cycles()` includes work compiled blocks have not reported yet. Cycle counts under the JIT are block estimates, not per-instruction timing.
 - **Hooks.** Every host hook works under the JIT; see [HOST_HOOKS.md](HOST_HOOKS.md#under-the-jit).
@@ -299,11 +300,11 @@ How it behaves:
 
 Verification: the m68k-rs fixtures give the same per-fixture results with the interpreter, the JIT and the JIT with direct memory access on the same memory map. `host_hooks_jit` and `host_hooks_jit_direct` check translated byte/word/long access against a C reference. The direct variant also checks that devices and regions outside the window keep their handlers, and exercises the x86-64 fault recovery. `uae_cpu_bench` measures throughput; see [Benchmarks](#benchmarks).
 
-Limitations: no JIT with MSVC; direct memory access needs a window covering the guest address space and has no fault recovery on AArch64; one CPU per process.
+Limitations: no JIT with MSVC; direct memory access needs a window covering the guest address space and has no fault recovery on AArch64; the JIT FPU computes in double precision; one CPU per process.
 
 #### Benchmarks
 
-`uae_cpu_bench` (built with the tests, source in [bench/](bench/uae_cpu_bench.c)) times small 68020 programs in each execution mode: `interpreter`, `jit` (translated code calls the region handlers) and `jit-direct` (`jit_direct_memory`, RAM accessed inline). It reports the best of several runs and the speedup over the interpreter:
+`uae_cpu_bench` (built with the tests, source in [bench/](bench/uae_cpu_bench.c)) times small 68020 programs in each execution mode: `interpreter`, `jit` (translated code calls the region handlers) `jit-direct` (`jit_direct_memory`, RAM accessed inline) and, for the FPU workload, `jit-fpu` (`jit-direct` plus `jit_fpu`). It reports the best of several runs and the speedup over the interpreter:
 
 | Workload | Exercises |
 |----------|-----------|
@@ -311,6 +312,7 @@ Limitations: no JIT with MSVC; direct memory access needs a window covering the 
 | `bytemix` | Byte reads mixed into a checksum |
 | `memcopy` | 64 KB long copy plus a byte sum |
 | `device` | Word reads from a custom-mapped device (must reach the handler in every mode) |
+| `fpu` | FPU arithmetic, compare, branch and store on a 68040 with host doubles |
 
 ```sh
 ./build/uae_cpu_bench                          # all workloads, best of 3

@@ -7,6 +7,11 @@
  *   interpreter  jit_enabled = false
  *   jit          jit_enabled; translated code calls the region handlers
  *   jit-direct   jit_enabled + jit_direct_memory; RAM is accessed inline
+ *   jit-fpu      jit-direct + jit_fpu; FPU instructions are translated too
+ *                (FPU workloads only)
+ *
+ * FPU workloads use the host-double backend (fpu_softfloat = false) in every
+ * mode, since that is what jit_fpu requires.
  *
  * Every run is checked against a reference computed in C, so the benchmark
  * is also a correctness test: it exits with status 1 when any result is
@@ -45,8 +50,8 @@
 #define OP_EXEC_RETURN 0x7100 /* MOVEQ with bit 8 set: not a valid encoding */
 #define RUN_TIME_LIMIT 120.0  /* seconds; a longer run counts as a failure */
 
-enum { MODE_INTERP, MODE_JIT, MODE_JIT_DIRECT, MODE_COUNT };
-static const char *const mode_names[MODE_COUNT] = { "interpreter", "jit", "jit-direct" };
+enum { MODE_INTERP, MODE_JIT, MODE_JIT_DIRECT, MODE_JIT_FPU, MODE_COUNT };
+static const char *const mode_names[MODE_COUNT] = { "interpreter", "jit", "jit-direct", "jit-fpu" };
 
 static uae_cpu_t *s_cpu;
 static uint8_t *s_ram;
@@ -62,6 +67,7 @@ typedef struct {
     uint32_t end_pc;  /* address of the exec-return opcode */
     uint32_t outer;   /* outer passes at full scale (D7 + 1) */
     bool device;      /* maps the counting device at DEVICE_ADDR */
+    bool fpu;         /* 68040 FPU on host doubles; adds the jit-fpu mode */
     bool (*check)(uint32_t outer);
 } workload_t;
 
@@ -206,13 +212,60 @@ static bool check_device(uint32_t outer)
     return s_device_reads == reads && (reg(UAE_REG_D2) & 0xFFFF) == d2;
 }
 
+/* FPU arithmetic, compare and branch, results written to memory. Every value
+ * is exact in a double while 2 * x stays below 1e6 (up to ~60 passes). */
+static const uint16_t fpu_code[] = {
+    0xF23C, 0x4000, 0x0000, 0x0000, /* 1000 FMOVE.L #0,FP0          */
+    0xF23C, 0x4080, 0x0000, 0x0001, /* 1008 FMOVE.L #1,FP1          */
+    0x263C, 0x0000, 0x4000,         /* 1010 outer: MOVE.L #$4000,D3 */
+    0x41F9, 0x0008, 0x0000,         /* 1016 LEA $80000,A0           */
+    0xF23C, 0x44A2, 0x3F00, 0x0000, /* 101C loop: FADD.S #0.5,FP1   */
+    0xF200, 0x0500,                 /* 1024 FMOVE FP1,FP2           */
+    0xF23C, 0x4123, 0x0000, 0x0002, /* 1028 FMUL.L #2,FP2           */
+    0xF200, 0x0822,                 /* 1030 FADD FP2,FP0            */
+    0xF23C, 0x4038, 0x000F, 0x4240, /* 1034 FCMP.L #1000000,FP0     */
+    0xF285, 0x000A,                 /* 103C FBOLE skip              */
+    0xF23C, 0x4028, 0x000F, 0x4240, /* 1040 FSUB.L #1000000,FP0     */
+    0xF218, 0x7400,                 /* 1048 skip: FMOVE.D FP0,(A0)+ */
+    0x5383,                         /* 104C SUBQ.L #1,D3            */
+    0x66CC,                         /* 104E BNE loop                */
+    0x51CF, 0xFFBE,                 /* 1050 DBF D7,outer            */
+    0xF201, 0x6080,                 /* 1054 FMOVE.L FP1,D1          */
+    0xF202, 0x6000,                 /* 1058 FMOVE.L FP0,D2          */
+    OP_EXEC_RETURN                  /* 105C                         */
+};
+
+static bool check_fpu(uint32_t outer)
+{
+    double sum = 0.0, x = 1.0;
+    for (uint32_t n = 0; n < outer; n++) {
+        for (uint32_t i = 0; i < 0x4000; i++) {
+            x += 0.5;
+            sum += x * 2.0;
+            if (!(sum <= 1000000.0))
+                sum -= 1000000.0;
+            /* Each pass overwrites the same doubles: check the last one. */
+            if (n == outer - 1) {
+                uint64_t bits;
+                memcpy(&bits, &sum, sizeof(bits));
+                for (int b = 0; b < 8; b++) {
+                    if (s_ram[DATA_ADDR + i * 8 + b] != (uint8_t)(bits >> (56 - 8 * b)))
+                        return false;
+                }
+            }
+        }
+    }
+    return reg(UAE_REG_D1) == (uint32_t)(int32_t)x && reg(UAE_REG_D2) == (uint32_t)(int32_t)sum;
+}
+
 #define WORDS(a) (sizeof(a) / sizeof((a)[0]))
 
 static const workload_t workloads[] = {
-    { "arith",   "register arithmetic, no memory access",  arith_code,   WORDS(arith_code),   0x1018, 250, false, check_arith },
-    { "bytemix", "byte reads mixed into a checksum",       bytemix_code, WORDS(bytemix_code), 0x1022, 200, false, check_bytemix },
-    { "memcopy", "64 KB long copy plus byte sum",          memcopy_code, WORDS(memcopy_code), 0x1030, 350, false, check_memcopy },
-    { "device",  "word reads from a custom-mapped device", device_code,  WORDS(device_code),  0x1018, 100, true,  check_device },
+    { "arith",   "register arithmetic, no memory access",  arith_code,   WORDS(arith_code),   0x1018, 250, false, false, check_arith },
+    { "bytemix", "byte reads mixed into a checksum",       bytemix_code, WORDS(bytemix_code), 0x1022, 200, false, false, check_bytemix },
+    { "memcopy", "64 KB long copy plus byte sum",          memcopy_code, WORDS(memcopy_code), 0x1030, 350, false, false, check_memcopy },
+    { "device",  "word reads from a custom-mapped device", device_code,  WORDS(device_code),  0x1018, 100, true,  false, check_device },
+    { "fpu",     "FPU arithmetic, compare, branch, store", fpu_code,     WORDS(fpu_code),     0x105C, 50,  false, true,  check_fpu },
 };
 #define WORKLOAD_COUNT (sizeof(workloads) / sizeof(workloads[0]))
 
@@ -287,11 +340,12 @@ static double run_once(const workload_t *w, int mode, uint32_t outer, bool *ok, 
     double t0, elapsed;
 
     memset(&cfg, 0, sizeof(cfg));
-    cfg.cpu_type = UAE_CPU_TYPE_68020;
-    cfg.fpu_type = UAE_FPU_NONE;
-    cfg.fpu_softfloat = true;
+    cfg.cpu_type = w->fpu ? UAE_CPU_TYPE_68040 : UAE_CPU_TYPE_68020;
+    cfg.fpu_type = w->fpu ? UAE_FPU_68040 : UAE_FPU_NONE;
+    cfg.fpu_softfloat = !w->fpu;
     cfg.jit_enabled = mode != MODE_INTERP;
-    cfg.jit_direct_memory = mode == MODE_JIT_DIRECT;
+    cfg.jit_direct_memory = mode == MODE_JIT_DIRECT || mode == MODE_JIT_FPU;
+    cfg.jit_fpu = mode == MODE_JIT_FPU;
     uae_cpu_set_config(s_cpu, &cfg);
 
     memset(s_ram, 0, RAM_SIZE);
@@ -410,7 +464,7 @@ int main(int argc, char **argv)
         have_jit = code_size > 0;
     }
 
-    printf("uae_cpu_bench: 68020, best of %d run%s, %s size%s\n", repeat, repeat == 1 ? "" : "s",
+    printf("uae_cpu_bench: 68020 (fpu: 68040 on host doubles), best of %d run%s, %s size%s\n", repeat, repeat == 1 ? "" : "s",
            quick ? "quick" : "full", have_jit ? "" : ", no JIT in this build");
     printf("%-8s %-12s %7s %10s %10s  %s\n", "workload", "mode", "passes", "seconds", "vs interp", "check");
 
@@ -426,6 +480,8 @@ int main(int argc, char **argv)
             bool all_ok = true;
 
             if (mode != MODE_INTERP && !have_jit)
+                continue;
+            if (mode == MODE_JIT_FPU && !wl->fpu)
                 continue;
             for (int r = 0; r < repeat; r++) {
                 bool ok;
