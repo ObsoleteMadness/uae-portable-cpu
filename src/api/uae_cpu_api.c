@@ -65,7 +65,7 @@ void uae_cpu_set_config(uae_cpu_t *cpu, const uae_cpu_config_t *config) {
     currprefs.cpu_compatible = (config->timing_mode >= 1);
     currprefs.cpu_cycle_exact = (config->timing_mode >= 2);
     currprefs.fpu_mode = config->fpu_softfloat ? 0 : 1;
-    currprefs.cachesize = config->jit_enabled ? config->jit_cache_size : 0;
+    uae_host_configure_jit(config->jit_enabled, config->jit_cache_size, config->jit_follow_cacr);
     g_unmapped_bus_error = config->unmapped_bus_error;
 
     changed_prefs = currprefs;
@@ -411,7 +411,7 @@ void uae_cpu_signal_irq(uae_cpu_t *cpu) {
 
 uint64_t uae_cpu_get_cycles(uae_cpu_t *cpu) {
     (void)cpu;
-    return currcycle > 0 ? (uint64_t)(currcycle / CYCLE_UNIT) : 0;
+    return uae_host_cycles();
 }
 
 void uae_cpu_raise_bus_error(uae_cpu_t *cpu, uint32_t addr, bool is_write, int size) {
@@ -420,11 +420,18 @@ void uae_cpu_raise_bus_error(uae_cpu_t *cpu, uint32_t addr, bool is_write, int s
 }
 
 void uae_cpu_invalidate_code(uae_cpu_t *cpu, uint32_t addr, uint32_t size) {
-    /* The JIT backends are not part of this build, so there is no translated
-     * code to discard. The entry point exists so hosts can call it unconditionally. */
     (void)cpu;
-    (void)addr;
-    (void)size;
+    uae_host_invalidate_code(addr, size);
+}
+
+int uae_cpu_set_jit_memory_base(uae_cpu_t *cpu, uint8_t *base) {
+    (void)cpu;
+    return uae_host_set_jit_memory_base(base);
+}
+
+uint32_t uae_cpu_get_jit_code_size(uae_cpu_t *cpu) {
+    (void)cpu;
+    return uae_host_jit_code_size();
 }
 
 uint32_t uae_cpu_get_mem_flags(uae_cpu_t *cpu, uint32_t addr) {

@@ -59,3 +59,28 @@ jobs:
 
       - name: Run CTest
         run: ctest --test-dir build -C Release --output-on-failure
+
+  no-jit:
+    name: Interpreter only, UAE_CPU_JIT=OFF (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ ubuntu-latest, macos-latest ]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure CMake
+        run: >
+          cmake -B build
+          -DCMAKE_BUILD_TYPE=Release
+          -DENABLE_TESTS=ON
+          -DUAE_CPU_JIT=OFF
+
+      - name: Build
+        run: cmake --build build --config Release -j
+
+      - name: Run CTest
+        run: ctest --test-dir build -C Release --output-on-failure

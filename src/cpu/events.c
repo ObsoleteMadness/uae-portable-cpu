@@ -11,6 +11,13 @@
 
 #include "options_cpu.h"
 #include "events.h"
+#include "host_hooks.h"
+
+#ifdef JIT
+int pissoff_value = 0;
+int pissoff_nojit_value = 0;
+int pissoff = 0;
+#endif
 
 #ifndef WINUAE_FOR_HATARI
 void do_cycles_normal(int cycles_to_add)
@@ -47,6 +54,11 @@ void do_cycles_normal(int cycles_to_add)
 
 void do_cycles_slow (int cycles_to_add)
 {
+	/* Compiled code keeps its own countdown; fold it in while the JIT runs. */
+	if (g_jit_run_active) {
+		uae_host_jit_do_cycles(cycles_to_add);
+		return;
+	}
 //fprintf ( stderr , "  do_cycles_slow add=%d curr=%d -> new=%d\n" , cycles_to_add , currcycle , currcycle+cycles_to_add );
 	currcycle += cycles_to_add;
 }

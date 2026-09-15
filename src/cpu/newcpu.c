@@ -157,7 +157,13 @@ int quit_program = 0;			/* from main.cpp */
 #endif
 
 
-void (*flush_icache)(int);
+/* No-op until compiler_init() installs the real flush: MMU and CACR paths
+ * call flush_icache() even when the JIT is built but not enabled. */
+static void flush_icache_noop(int v)
+{
+	(void)v;
+}
+void (*flush_icache)(int) = flush_icache_noop;
 
 #if COUNT_INSTRS
 static unsigned long int instrcount[65536];
@@ -1886,6 +1892,10 @@ void set_cpu_caches (bool flush)
 
 #ifdef JIT
 	if (currprefs.cachesize) {
+		if (!g_jit_follow_cacr) {
+			/* Host chose always-on translation (see uae_host_configure_jit). */
+			set_cache_state (1);
+		} else
 		if (currprefs.cpu_model < 68040) {
 			set_cache_state (regs.cacr & 1);
 			if (regs.cacr & 0x08) {
@@ -5968,6 +5978,23 @@ void execute_normal(void)
 	cpu_history pc_hist[MAXRUN];
 	int total_cycles;
 
+	/* Translated code derives the 68k PC from host pointers through the flat
+	 * JIT window (uae_cpu_set_jit_memory_base). Code outside it has no such
+	 * pointer, so interpret it a block at a time and let the dispatcher try
+	 * again at the next block. */
+	if (!uae_host_jit_pc_translatable()) {
+		m68k_setpc(m68k_getpc());
+		for (;;) {
+			r->instruction_pc = m68k_getpc();
+			r->opcode = x_get_iword(0);
+			special_mem = special_mem_default;
+			(*cpufunctbl[r->opcode])(r->opcode);
+			do_cycles(4 * CYCLE_UNIT);
+			if (end_block(r->opcode) || r->spcflags)
+				return;
+		}
+	}
+
 	if (check_for_cache_miss ())
 		return;
 
@@ -6119,13 +6146,15 @@ static void m68k_run_jit(void)
 
 				((compiled_handler*)(pushall_call_handler))();
 				/* Whenever we return from that, we should check spcflags */
+#ifndef WINUAE_FOR_HATARI
 				check_uae_int_request();
+#endif
 				if (regs.spcflags) {
 #if defined(JIT_HAS_BUS_ERROR_RECOVERY)
 					jit_in_compiled_code = false;
 #endif
 					if (do_specialties(0)) {
-						STOPTRY;
+						/* No TRY is open in this function; in C, STOPTRY would pop the caller's. */
 						return;
 					}
 #if defined(JIT_HAS_BUS_ERROR_RECOVERY)
@@ -6175,6 +6204,13 @@ static void m68k_run_jit(void)
 	}
 
 }
+/* Entry point for uae_host_run(): runs the JIT dispatcher until a special
+ * condition (end of timeslice, budget spent) makes it return. */
+void uae_host_run_jit(void)
+{
+	m68k_run_jit();
+}
+
 #endif /* JIT */
 
 #ifndef CPUEMU_0

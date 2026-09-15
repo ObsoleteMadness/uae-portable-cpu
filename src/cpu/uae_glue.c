@@ -236,3 +236,48 @@ int cctrue(int cc)
     }
     return 0;
 }
+
+/*
+ * Converts a TCHAR string to a newly allocated char string.
+ *
+ * Arguments:
+ *   s: Source string, or NULL.
+ *
+ * Returns:
+ *   A malloc'd copy (TCHAR is char in this core), or NULL when s is NULL.
+ */
+char *ua(const TCHAR *s)
+{
+    return s ? strdup(s) : NULL;
+}
+
+/*
+ * Reports an unrecoverable JIT compiler error and aborts the process.
+ *
+ * Arguments:
+ *   format: printf-style message.
+ */
+void jit_abort(const TCHAR *format, ...)
+{
+    va_list ap;
+    va_start(ap, format);
+    fputs("JIT: ", stderr);
+    vfprintf(stderr, format, ap);
+    fputc('\n', stderr);
+    va_end(ap);
+    abort();
+}
+
+/*
+ * Converts a char string to a newly allocated TCHAR string.
+ *
+ * Arguments:
+ *   s: Source string, or NULL.
+ *
+ * Returns:
+ *   A malloc'd copy (TCHAR is char in this core), or NULL when s is NULL.
+ */
+TCHAR *au(const char *s)
+{
+    return s ? strdup(s) : NULL;
+}

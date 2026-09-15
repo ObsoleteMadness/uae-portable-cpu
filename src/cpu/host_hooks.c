@@ -34,6 +34,29 @@ uae_cpu_host_hooks_t g_host_hooks;
 int g_execute_depth = 0;
 bool g_unmapped_bus_error = false;
 int g_host_fline_consulted = 0;
+bool g_jit_run_active = false;
+bool g_jit_follow_cacr = false;
+int64_t g_jit_run_target = 0;
+
+#ifdef JIT
+extern void compiler_init(void);
+extern uae_u32 get_jitted_size(void);
+extern void set_cache_state(int enabled);
+/* Cache size currently allocated by alloc_cache(), in KB. */
+static int s_jit_cache_kb = 0;
+/* Whether the JIT tables were built with DBF routed to its C handler. */
+static bool s_jit_tables_dbf_hook = false;
+
+/* Rebuilds the CPU and compiler tables after host-visible opcode policy changed. */
+static void uae_host_jit_rebuild(void)
+{
+    if (!currprefs.cachesize)
+        return;
+    if (flush_icache)
+        flush_icache(3);
+    init_m68k();
+}
+#endif
 
 #define UAE_HOST_MAX_RESERVED_RANGES 16
 
@@ -55,6 +78,11 @@ void uae_host_set_hooks(const uae_cpu_host_hooks_t *hooks)
         g_host_hooks = *hooks;
     else
         memset(&g_host_hooks, 0, sizeof(g_host_hooks));
+#ifdef JIT
+    /* DBF compiles natively unless the host wants to see delay loops. */
+    if (currprefs.cachesize && (g_host_hooks.dbf_spin != NULL) != s_jit_tables_dbf_hook)
+        uae_host_jit_rebuild();
+#endif
 }
 
 /*
@@ -76,6 +104,13 @@ int uae_host_reserve_opcodes(uint16_t first, uint16_t last)
     s_reserved[s_reserved_count].first = first;
     s_reserved[s_reserved_count].last = last;
     s_reserved_count++;
+#ifdef JIT
+    /* Compiled blocks must also stop compiling these words. */
+    if (currprefs.cachesize) {
+        uae_host_jit_rebuild();
+        return 0;
+    }
+#endif
     /* Patch the live table now; later table builds re-apply the ranges. */
     uae_host_apply_reserved_opcodes();
     return 0;
@@ -178,6 +213,9 @@ int uae_host_dispatch_trap_opcode(uint32_t opcode)
     uaecptr pc = m68k_getpc();
     int handled = 0;
 
+    /* Translated code does not maintain instruction_pc; exceptions raised for
+     * this word must report it as the faulting instruction. */
+    regs.instruction_pc = pc;
     opcode &= 0xffff;
     switch (opcode & 0xF000) {
     case 0xA000:
@@ -307,6 +345,30 @@ int uae_host_run(int cycles)
     if (g_host_hooks.get_irq)
         set_special(SPCFLAG_INT);
 
+#ifdef JIT
+    /* The outermost execute call runs translated code. Nested calls (from
+     * inside a hook) stay on the interpreter: compiled code must not be
+     * re-entered from a C handler it called. */
+    if (currprefs.cachesize && g_execute_depth == 1 && currprefs.cpu_model >= 68020 &&
+        !currprefs.cpu_compatible && !currprefs.mmu_model) {
+        evt_t budget = target - currcycle;
+        g_jit_run_target = target;
+        pissoff_value = pissoff = budget > INT_MAX ? INT_MAX : (int)budget;
+        g_jit_run_active = true;
+        TRY(prb) {
+            uae_host_run_jit();
+        } CATCH(prb) {
+            uae_host_bus_error_caught();
+        } ENDTRY
+        /* Credit whatever the last compiled chain consumed. */
+        currcycle += pissoff_value - pissoff;
+        pissoff_value = pissoff = 0;
+        g_jit_run_active = false;
+        g_execute_depth--;
+        return (int)((currcycle - start) / CYCLE_UNIT);
+    }
+#endif
+
     while (!done) {
         TRY(prb) {
             while (currcycle < target && !regs.stopped && !regs.halted) {
@@ -389,4 +451,207 @@ int uae_host_step(void)
     if (exited)
         return 0;
     return (int)((currcycle - start) / CYCLE_UNIT);
+}
+
+/*
+ * Applies the JIT settings from uae_cpu_config_t. Must run before init_m68k()
+ * builds the tables: build_comp() needs the compiler initialised and the
+ * translation cache allocated.
+ *
+ * Memory is always accessed through the bank handlers (canbang = false), so
+ * compiled code honours custom devices, ROM write protection and bus errors
+ * for any memory map.
+ *
+ * WinUAE only translates while the guest has enabled the CPU cache through
+ * CACR. That suits an Amiga (Kickstart enables it) but not a generic host,
+ * so by default translation is always on and jit_follow_cacr restores the
+ * WinUAE behaviour.
+ *
+ * Arguments:
+ *   enabled: uae_cpu_config_t.jit_enabled.
+ *   cache_kb: Translation cache size in KB; 0 selects 8192.
+ *   follow_cacr: uae_cpu_config_t.jit_follow_cacr.
+ */
+void uae_host_configure_jit(bool enabled, uint32_t cache_kb, bool follow_cacr)
+{
+    g_jit_follow_cacr = follow_cacr;
+#ifdef JIT
+    int want = 0;
+
+    /* The dispatcher only exists for 68020+ without MMU or prefetch emulation. */
+    if (enabled && currprefs.cpu_model >= 68020 && !currprefs.mmu_model && !currprefs.cpu_compatible) {
+        want = cache_kb ? (int)cache_kb : 8192;
+        if (want < MIN_JIT_CACHE)
+            want = MIN_JIT_CACHE;
+        if (want > MAX_JIT_CACHE)
+            want = MAX_JIT_CACHE;
+    }
+
+    compiler_init();
+    canbang = false;
+    jit_direct_compatible_memory = false;
+
+    changed_prefs.comptrustbyte = changed_prefs.comptrustword = 1;
+    changed_prefs.comptrustlong = changed_prefs.comptrustnaddr = 1;
+    changed_prefs.compnf = true;
+    changed_prefs.compfpu = false;
+    changed_prefs.comp_hardflush = false;
+    changed_prefs.comp_constjump = true;
+    changed_prefs.fpu_strict = currprefs.fpu_strict;
+    changed_prefs.cachesize = want;
+
+    /* check_prefs_changed_comp() (re)allocates the cache when the size differs
+     * from the current one, so present the previously allocated size. */
+    currprefs.cachesize = s_jit_cache_kb;
+    check_prefs_changed_comp(false);
+    s_jit_cache_kb = currprefs.cachesize;
+    s_jit_tables_dbf_hook = g_host_hooks.dbf_spin != NULL;
+    pissoff_value = pissoff = 0;
+    /* Without CACR gating the translator is enabled as soon as there is a cache. */
+    if (currprefs.cachesize)
+        set_cache_state(follow_cacr ? ((regs.cacr & (currprefs.cpu_model >= 68040 ? 0x8000 : 1)) != 0) : 1);
+#else
+    (void)enabled;
+    (void)cache_kb;
+    (void)follow_cacr;
+    currprefs.cachesize = 0;
+#endif
+}
+
+/*
+ * Decides which opcodes compiled code must hand to the C opcode handlers.
+ *
+ * Arguments:
+ *   opcode: 16-bit opcode word.
+ *
+ * Returns:
+ *   Non-zero for host-reserved opcodes, and for DBF Dn while a dbf_spin
+ *   hook is installed (the C handler is where the hook is offered).
+ */
+int uae_host_jit_must_interpret(uint32_t opcode)
+{
+#ifdef JIT
+    if ((opcode & 0xFFF8) == 0x51C8 && g_host_hooks.dbf_spin) {
+        s_jit_tables_dbf_hook = true;
+        return 1;
+    }
+#endif
+    return uae_host_opcode_reserved(opcode);
+}
+
+/*
+ * do_cycles() while the JIT dispatcher is running.
+ *
+ * Compiled blocks subtract their cycles from countdown (pissoff) instead of
+ * calling do_cycles(), and call do_nothing() -> do_cycles(0) when countdown
+ * expires or a special flag is set. Fold what they consumed into currcycle,
+ * reload the countdown with the remaining budget, and ask the dispatcher to
+ * return once the budget is gone.
+ *
+ * Arguments:
+ *   cycles: Interpreter cycles to add (0 from compiled code).
+ */
+void uae_host_jit_do_cycles(int cycles)
+{
+#ifdef JIT
+    evt_t remaining;
+
+    currcycle += (evt_t)cycles + (pissoff_value - pissoff);
+    remaining = g_jit_run_target - currcycle;
+    if (remaining <= 0) {
+        set_special(SPCFLAG_BRK);
+        remaining = 0;
+    }
+    pissoff_value = pissoff = remaining > INT_MAX ? INT_MAX : (int)remaining;
+#else
+    currcycle += cycles;
+#endif
+}
+
+/*
+ * Discards translations that may cover modified guest code.
+ *
+ * Uses the configured flush (lazy by default: affected blocks are
+ * checksummed before reuse) and asks compiled code to stop building the
+ * current block.
+ *
+ * Arguments:
+ *   addr: Start of the modified range (unused: flushes are cache-wide).
+ *   size: Length of the modified range; 0 is a no-op.
+ */
+void uae_host_invalidate_code(uint32_t addr, uint32_t size)
+{
+    (void)addr;
+#ifdef JIT
+    if (size == 0 || !currprefs.cachesize || !flush_icache)
+        return;
+    flush_icache(3);
+    set_special(SPCFLAG_END_COMPILE);
+#else
+    (void)size;
+#endif
+}
+
+/* CPU cycles since init, including compiled work not yet folded into currcycle. */
+uint64_t uae_host_cycles(void)
+{
+    evt_t c = currcycle;
+#ifdef JIT
+    if (g_jit_run_active)
+        c += pissoff_value - pissoff;
+#endif
+    return c > 0 ? (uint64_t)(c / CYCLE_UNIT) : 0;
+}
+
+/* Bytes of translated host code in the cache. */
+uint32_t uae_host_jit_code_size(void)
+{
+#ifdef JIT
+    return currprefs.cachesize ? (uint32_t)get_jitted_size() : 0;
+#else
+    return 0;
+#endif
+}
+
+/*
+ * Declares the flat guest window used to translate code (natmem_offset).
+ *
+ * Arguments:
+ *   base: Host address of guest address 0, or NULL to stop translating.
+ *
+ * Returns:
+ *   0 on success, -1 when the library was built without a JIT.
+ */
+int uae_host_set_jit_memory_base(uint8_t *base)
+{
+#ifdef JIT
+    if (natmem_offset != base) {
+        natmem_offset = base;
+        /* Translations embed host PCs derived from the old base. */
+        if (currprefs.cachesize && flush_icache)
+            flush_icache(3);
+    }
+    return 0;
+#else
+    (void)base;
+    return -1;
+#endif
+}
+
+int uae_host_jit_pc_translatable(void)
+{
+#ifdef JIT
+    uaecptr pc;
+    addrbank *bank;
+
+    if (!natmem_offset)
+        return 0;
+    pc = m68k_getpc();
+    bank = &get_mem_bank(pc);
+    return bank->baseaddr != NULL &&
+           bank->baseaddr - bank->start == natmem_offset &&
+           regs.pc_p == natmem_offset + pc;
+#else
+    return 0;
+#endif
 }

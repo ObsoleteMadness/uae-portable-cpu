@@ -12,8 +12,7 @@ All Amiga- and Atari ST-specific hardware dependencies, custom chipset logic, fl
 - **FPU & MMU Emulation**:
   - IEEE-754 compliant SoftFloat FPU supporting 68881, 68882, and integrated 68040/060 FPUs.
   - 68030 and 68040 MMU translation support.
-- **JIT Compilation Backends**:
-  - High-performance JIT compilation engines for **ARM64 (AArch64)** and **x86_64** in `src/cpu/jit/`.
+- **JIT Compilation**: ARM64 (AArch64) and x86-64 dynamic translation for 68020+ code, built by default on supported hosts. See [JIT Compiler](#3-jit-compiler).
 - **Hardware Agnostic**:
   - Zero peripheral baggage: No Amiga chipset (Agnus/Paula/Denise) or Atari ST hardware (FDC, ACIA, Blitter, YM2149).
   - Flexible memory callbacks: Host applications supply simple read/write callbacks or directly mapped address spaces.
@@ -46,8 +45,9 @@ uae-portable-cpu/
 │       ├── uae_glue.c / .h   # Minimal portable hardware glue layer
 │       ├── host_hooks.c / .h # Host hook dispatch and re-entrant execute loop
 │       └── jit/              # JIT compilers
+│           ├── compemu*.cpp  # Architecture dispatchers (C++ with C linkage to the core)
 │           ├── arm/          # ARM64 (AArch64) JIT backend
-│           └── x86/          # x86 / x86_64 JIT backend
+│           └── x86/          # x86-64 JIT backend
 ├── tests/                    # Test suites & fixtures
 │   ├── test_basic.c          # Basic API smoke tests
 │   ├── test_uae_cpu.c        # Native UAE core unit tests (68000–68060, FPU, MMU)
@@ -90,6 +90,7 @@ cmake --install build --prefix /usr/local
 | :--- | :--- | :--- |
 | `ENABLE_TESTS` | `ON` | Build the test executables and register them with CTest |
 | `UAE_CPU_MUSASHI_API` | `ON` | Build the Musashi-compatible `m68k_*` API. Turn off when the host also links Musashi |
+| `UAE_CPU_JIT` | `AUTO` | Build the JIT compiler. `AUTO` enables it on AArch64 and x86-64 with GCC or Clang; `ON` fails the configure elsewhere; `OFF` builds the interpreter only |
 | `UAE_CPU_ISOLATE_SYMBOLS` | `OFF` | Also build `uaecpu_isolated`, a static library exporting only the public API (Apple ld or GNU ld + objcopy; not MSVC). Adds the `isolated_link` test |
 
 ---
@@ -129,7 +130,7 @@ vcpkg install --overlay-ports=ports/uae-portable-cpu uae-portable-cpu
 
 ## Test Verification Matrix
 
-All 7 test suites pass via `ctest`:
+All test suites pass via `ctest` (12 with the JIT built):
 
 | Test Target | Description | Pass Rate | Status |
 | :--- | :--- | :--- | :--- |
@@ -139,6 +140,8 @@ All 7 test suites pass via `ctest`:
 | **`musashi_68040`** | Musashi 68040 test suite | 16 / 18 (88.9%)* | **PASSED** |
 | **`m68k_rs_coverage`** | `m68k-rs` comprehensive instruction coverage | 25 / 25 (100%) | **PASSED** |
 | **`m68k_rs_extra`** | `m68k-rs` extended instruction test fixtures | 102 / 127 (80.3%) | **PASSED** |
+| **`host_hooks_jit`**, **`test_uae_cpu_jit`** | The same suites with 68020+ scenarios translated by the JIT | 100% | **PASSED** |
+| **`m68k_rs_coverage_jit`**, **`m68k_rs_extra_jit`**, **`musashi_68040_jit`** | Fixture suites under the JIT (m68k-rs code translated from a flat memory map) | Same as interpreter | **PASSED** |
 | **`host_hooks`** | Host hook contracts: traps, Line-A/F, TRAP #n, exceptions, IRQ, DBF spin, bus errors, reserved opcodes, memory flags | 100% | **PASSED** |
 
 *\* For detailed analysis of the subtle differences between Musashi's test fixtures and Motorola silicon behavior (such as BCD arithmetic on invalid non-decimal inputs and division overflow CCR flag status), see [WALKTHROUGH.md](WALKTHROUGH.md).*
@@ -260,7 +263,39 @@ int main(void) {
 }
 ```
 
-### 3. Host Hooks
+### 3. JIT Compiler
+
+When the library is built with `UAE_CPU_JIT`, 68020 and later CPUs (without MMU or prefetch emulation) can run through the WinUAE / Amiberry dynamic translator:
+
+```c
+static uint8_t guest[16 * 1024 * 1024];      /* guest address 0 .. 16 MB */
+
+uae_cpu_config_t cfg = {
+    .cpu_type = UAE_CPU_TYPE_68040,
+    .fpu_type = UAE_FPU_68040,
+    .fpu_softfloat = true,
+    .jit_enabled = true,
+    .jit_cache_size = 16384,                 /* KB; 0 selects 8192 */
+};
+uae_cpu_t *cpu = uae_cpu_create(&cfg);
+uae_cpu_map_ram(cpu, 0, sizeof(guest), guest);
+uae_cpu_set_jit_memory_base(cpu, guest);     /* host byte for guest a is guest + a */
+```
+
+How it behaves:
+
+- **Flat code window.** Translated code derives the 68k PC from host pointers, so the JIT only translates code in regions mapped with `uae_cpu_map_memory()` whose host pointer equals `base + guest address`. Declare that base with `uae_cpu_set_jit_memory_base()`. A RAM buffer mapped at guest 0 qualifies, as does one reservation covering the whole address space. Code anywhere else (custom devices, Musashi-style callbacks) runs through the interpreter inside the JIT dispatcher.
+- **Memory access** from translated code always goes through the bank handlers, so custom devices, ROM write protection and `uae_cpu_raise_bus_error()` behave as in the interpreter.
+- **Cache gating.** WinUAE only translates while the guest has enabled the CPU cache through `CACR`. By default the library translates whenever the JIT is on. Set `jit_follow_cacr` to restore the WinUAE behaviour.
+- **Execute budget.** `uae_cpu_execute(cpu, cycles)` stops translated code when the budget is spent. `uae_cpu_get_cycles()` includes work compiled blocks have not reported yet. Cycle counts under the JIT are block estimates, not per-instruction timing.
+- **Hooks.** Every host hook works under the JIT; see [HOST_HOOKS.md](HOST_HOOKS.md#under-the-jit).
+- **Self-modifying code.** Call `uae_cpu_invalidate_code()` after the host writes guest code; translated blocks are also checksummed before reuse.
+
+Verification: the m68k-rs fixtures give the same per-fixture results with the JIT as with the interpreter on the same memory map, and `host_hooks_jit` checks translated byte/word/long memory access against a C reference. On an Apple M-series host a byte-mixing loop runs about 8x faster than the interpreter.
+
+Limitations: no JIT with MSVC; no direct (inlined) host memory access yet; one CPU per process.
+
+### 4. Host Hooks
 
 Hosts that service guest calls themselves (trap tables, HLE, paravirtual devices) install hooks instead of patching the core:
 

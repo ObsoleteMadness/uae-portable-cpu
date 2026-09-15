@@ -109,6 +109,48 @@ int uae_host_run(int cycles);
 /* Single-instruction loop behind uae_cpu_step(). Re-entrant. */
 int uae_host_step(void);
 
+/*
+ * JIT integration. While uae_host_run() is inside the JIT dispatcher,
+ * g_jit_run_active is true and g_jit_run_target is the currcycle value at
+ * which the execute call's budget is spent.
+ */
+extern bool g_jit_run_active;
+extern int64_t g_jit_run_target;
+
+/* When true, translation follows the guest CACR cache-enable bit (WinUAE). */
+extern bool g_jit_follow_cacr;
+
+/* Applies jit_enabled / jit_cache_size / jit_follow_cacr before the CPU tables are rebuilt. */
+void uae_host_configure_jit(bool enabled, uint32_t cache_kb, bool follow_cacr);
+
+/* True when compiled code must call this opcode's C handler (host hooks need it). */
+int uae_host_jit_must_interpret(uint32_t opcode);
+
+/* Cycle accounting for do_cycles() while compiled code is running (events.c). */
+void uae_host_jit_do_cycles(int cycles);
+
+/* Discards translations overlapping [addr, addr + size). */
+void uae_host_invalidate_code(uint32_t addr, uint32_t size);
+
+/* CPU cycles since init, including cycles compiled code has not yet reported. */
+uint64_t uae_host_cycles(void);
+
+/* Bytes of host code currently in the translation cache (0 without a JIT). */
+uint32_t uae_host_jit_code_size(void);
+
+/* Sets natmem_offset, the flat guest window translated code relies on. */
+int uae_host_set_jit_memory_base(uint8_t *base);
+
+/*
+ * True when the block at the current PC may be translated: a JIT memory base
+ * is set, the PC's bank maps host memory at base + address, and regs.pc_p
+ * agrees. Otherwise execute_normal() interprets the block.
+ */
+int uae_host_jit_pc_translatable(void);
+
+/* Enters the JIT dispatcher until a special condition returns (newcpu.c). */
+void uae_host_run_jit(void);
+
 /* uae_mem_flags_t bits of the bank covering addr, 0 when unmapped (memory.c). */
 uint32_t memory_host_flags(uint32_t addr);
 

@@ -15,6 +15,27 @@
 #define S_WRITE 2
 #define S_N_ADDR 4
 
+#ifdef JIT
+/*
+ * JIT memory model (see jit/compemu_support_*.cpp).
+ *
+ * special_mem collects the jit_read_flag / jit_write_flag of every bank an
+ * instruction touched while a block was being profiled, so accesses to
+ * indirect (IO) regions compile as helper calls. canbang enables direct
+ * host-pointer access through natmem_offset; while it is false every
+ * compiled memory access goes through the bank handlers.
+ */
+extern int special_mem;
+extern int special_mem_default;
+extern int jit_n_addr_unsafe;
+extern int jit_n_addr_bank_unsafe;
+extern bool canbang;
+extern bool jit_direct_compatible_memory;
+extern uae_u8 *natmem_offset;
+extern uae_u8 *natmem_reserved;
+extern size_t natmem_reserved_size;
+#endif
+
 typedef uae_u32 (REGPARAM3 *mem_get_func)(uaecptr) REGPARAM;
 typedef void (REGPARAM3 *mem_put_func)(uaecptr, uae_u32) REGPARAM;
 typedef uae_u8 *(REGPARAM3 *xlate_func)(uaecptr) REGPARAM;
@@ -39,14 +60,20 @@ enum {
 };
 
 typedef struct addrbank {
-    const char *name;
+    /* The accessors must stay first and in this order: the JIT calls them by
+     * fixed offset (lput = 3, wput = 4, bput = 5 pointers into the struct),
+     * matching the WinUAE / Amiberry addrbank layout. */
     mem_get_func lget, wget, bget;
     mem_put_func lput, wput, bput;
+    const char *name;
     xlate_func xlateaddr;
     check_func check;
     uae_u8 *baseaddr;
     uae_u32 mask;
     uae_u32 flags;
+    const char *label;       /* Short bank name used in JIT diagnostics */
+    uaecptr start;           /* Guest address the host mapping starts at */
+    uae_u32 allocated_size;  /* Length of the host mapping in bytes */
     uae_u32 host_flags;      /* uae_mem_flags_t bits given when mapped */
     uae_u32 jit_read_flag;   /* 0 = JIT may read directly, S_READ = via helper */
     uae_u32 jit_write_flag;  /* 0 = JIT may write directly, S_WRITE = via helper */
@@ -62,6 +89,21 @@ typedef struct addrbank {
 } addrbank;
 
 extern addrbank *mem_banks[MEMORY_BANKS];
+
+#define bankindex(addr) (((uaecptr)(addr)) >> 16)
+
+#ifdef JIT
+/* Host base per 64K bank: baseaddr[bankindex(a)] + a is the host byte for a. */
+extern uae_u8 *baseaddr[MEMORY_BANKS];
+/* Bank globals the JIT consults for ROM detection and fault probes; unused (zero) here. */
+extern addrbank kickmem_bank;
+extern addrbank rtarea_bank;
+extern addrbank a3000lmem_bank;
+extern addrbank a3000hmem_bank;
+/* Side-effect-free read of unmapped space for JIT fault handlers: never raises
+ * a bus error, returns defvalue. size is sz_byte / sz_word / sz_long. */
+extern uae_u32 dummy_get_safe(uaecptr addr, int size, bool inst, uae_u32 defvalue);
+#endif
 extern addrbank dummy_bank;
 extern addrbank musashi_bridge_bank;
 extern uae_u8 ce_cachable[65536];
@@ -156,11 +198,40 @@ static inline int valid_address(uaecptr addr, uae_u32 size) {
 #define get_word_compatible get_word
 #define get_byte_compatible get_byte
 
+#ifdef JIT
+/* Accessors used by the JIT-profiled opcode tables: record which bank types
+ * the instruction touched so compile_block() picks direct or helper access. */
+static inline uae_u32 get_long_jit(uaecptr addr) {
+    special_mem |= get_mem_bank(addr).jit_read_flag;
+    return get_long(addr);
+}
+static inline uae_u32 get_word_jit(uaecptr addr) {
+    special_mem |= get_mem_bank(addr).jit_read_flag;
+    return get_word(addr);
+}
+static inline uae_u32 get_byte_jit(uaecptr addr) {
+    special_mem |= get_mem_bank(addr).jit_read_flag;
+    return get_byte(addr);
+}
+static inline void put_long_jit(uaecptr addr, uae_u32 l) {
+    special_mem |= get_mem_bank(addr).jit_write_flag;
+    put_long(addr, l);
+}
+static inline void put_word_jit(uaecptr addr, uae_u32 w) {
+    special_mem |= get_mem_bank(addr).jit_write_flag;
+    put_word(addr, w);
+}
+static inline void put_byte_jit(uaecptr addr, uae_u32 b) {
+    special_mem |= get_mem_bank(addr).jit_write_flag;
+    put_byte(addr, b);
+}
+#else
 #define put_long_jit put_long
 #define put_word_jit put_word
 #define put_byte_jit put_byte
 #define get_long_jit get_long
 #define get_word_jit get_word
 #define get_byte_jit get_byte
+#endif
 
 #endif /* UAE_MEMORY_H */

@@ -20,6 +20,14 @@
 #include "uae_cpu.h"
 
 #define RAM_SIZE 0x100000 /* 1MB test RAM */
+
+/* UAE_TEST_JIT=1 re-runs the suite with the JIT enabled for 68020+ models. */
+static void apply_test_jit(uae_cpu_config_t *cfg) {
+    if (getenv("UAE_TEST_JIT")) {
+        cfg->jit_enabled = true;
+        cfg->jit_cache_size = 8192;
+    }
+}
 static uint8_t s_ram[RAM_SIZE];
 
 static void write_mem16(uint32_t addr, uint16_t val) {
@@ -49,6 +57,7 @@ static uint32_t read_mem32(uint32_t addr) {
 static void setup_test_program(uae_cpu_t *cpu, const uint16_t *opcodes, size_t count) {
     memset(s_ram, 0, sizeof(s_ram));
     uae_cpu_map_ram(cpu, 0x00000, RAM_SIZE, s_ram);
+    uae_cpu_set_jit_memory_base(cpu, s_ram);  /* flat JIT window (RAM at guest 0) */
     write_mem32(0x00, 0x80000); /* Initial SSP */
     write_mem32(0x04, 0x1000);  /* Initial PC */
     for (size_t i = 0; i < count; i++) {
@@ -75,6 +84,7 @@ static void test_cpu_models(void) {
 
     for (int i = 0; i < 6; i++) {
         cfg.cpu_type = models[i];
+        apply_test_jit(&cfg);
         uae_cpu_t *cpu = uae_cpu_create(&cfg);
         assert(cpu != NULL);
         uae_cpu_config_t out_cfg;
@@ -90,6 +100,7 @@ static void test_alu_ccr(void) {
     uae_cpu_config_t cfg;
     memset(&cfg, 0, sizeof(cfg));
     cfg.cpu_type = UAE_CPU_TYPE_68000;
+    apply_test_jit(&cfg);
     uae_cpu_t *cpu = uae_cpu_create(&cfg);
 
     /* Test ADD.L: 0x7FFFFFFF + 1 -> 0x80000000 (V=1, N=1, Z=0, C=0) */
@@ -129,6 +140,7 @@ static void test_68020_bitfields(void) {
     uae_cpu_config_t cfg;
     memset(&cfg, 0, sizeof(cfg));
     cfg.cpu_type = UAE_CPU_TYPE_68020;
+    apply_test_jit(&cfg);
     uae_cpu_t *cpu = uae_cpu_create(&cfg);
 
     /* Test BFEXTU: Extract 8 bits at offset 12 from 0x01234567 -> 0x34 */
@@ -164,6 +176,7 @@ static void test_68020_cas(void) {
     uae_cpu_config_t cfg;
     memset(&cfg, 0, sizeof(cfg));
     cfg.cpu_type = UAE_CPU_TYPE_68020;
+    apply_test_jit(&cfg);
     uae_cpu_t *cpu = uae_cpu_create(&cfg);
 
     /* Memory location 0x2000 has value 0x11112222 */
@@ -194,6 +207,7 @@ static void test_68881_fpu_softfloat(void) {
     cfg.cpu_type = UAE_CPU_TYPE_68040;
     cfg.fpu_type = UAE_FPU_68040;
     cfg.fpu_softfloat = true;
+    apply_test_jit(&cfg);
     uae_cpu_t *cpu = uae_cpu_create(&cfg);
 
     /* Test FMOVE.D and FMUL.D: 3.0 * 4.0 = 12.0 */
@@ -228,7 +242,10 @@ static void test_multi_instance_isolation(void) {
     memset(&cfg, 0, sizeof(cfg));
     cfg.cpu_type = UAE_CPU_TYPE_68000;
 
+    apply_test_jit(&cfg);
+
     uae_cpu_t *cpu1 = uae_cpu_create(&cfg);
+    apply_test_jit(&cfg);
     uae_cpu_t *cpu2 = uae_cpu_create(&cfg);
 
     uae_cpu_set_reg(cpu1, UAE_REG_D0, 0x11111111);

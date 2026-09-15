@@ -184,9 +184,11 @@ typedef struct {
 
 extern op_properties prop[65536];
 
+#include "host_hooks.h"
+
 STATIC_INLINE int end_block(uae_u16 opcode)
 {
-	return (prop[opcode].cflow & fl_end_block);
+	return (prop[opcode].cflow & fl_end_block) || uae_host_opcode_reserved(opcode);
 }
 
 #define SP_REG 15

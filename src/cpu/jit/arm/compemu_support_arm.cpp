@@ -3731,6 +3731,14 @@ void build_comp(void)
     }
 
     int count = 0;
+    /* Host hooks: opcodes the host must see run through their C handlers. */
+    for (opcode = 0; opcode < 65536; opcode++) {
+    	if (uae_host_jit_must_interpret(opcode)) {
+    		compfunctbl[cft_map(opcode)] = NULL;
+    		nfcompfunctbl[cft_map(opcode)] = NULL;
+    	}
+    }
+
     for (opcode = 0; opcode < 65536; opcode++) {
         if (compfunctbl[cft_map(opcode)])
             count++;

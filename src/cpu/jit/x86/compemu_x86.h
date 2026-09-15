@@ -52,7 +52,11 @@ typedef uae_u32 uintptr;
 
 /* Allocate memory near the JIT cache / .data segment for RIP-relative access.
  * options=0 uses anchor-based allocation; options=1 forces low 2GB (MAP_32BIT). */
+#ifdef __cplusplus
 extern void *jit_vm_acquire(uae_u32 size, int options = 0);
+#else
+extern void *jit_vm_acquire(uae_u32 size, int options);
+#endif
 
 #ifdef JIT_DEBUG
 /* dump some information (m68k block, x86 block addresses) about the compiler state */
@@ -78,10 +82,11 @@ struct cpu_history {
 	uae_u8  specmem;
 #endif
 };
+typedef struct cpu_history cpu_history;
 
 union cacheline {
 	cpuop_func *handler;
-	blockinfo_t * bi;
+	struct blockinfo_t * bi;
 };
 
 /* Use new spill/reload strategy when calling external functions */
@@ -531,10 +536,13 @@ struct op_properties {
 	uae_u8 is_addx;
 	uae_u8 cflow;
 };
+typedef struct op_properties op_properties;
 extern op_properties prop[65536];
+#include "host_hooks.h"
+
 static inline int end_block(uae_u32 opcode)
 {
-	return (prop[opcode].cflow & fl_end_block);
+	return (prop[opcode].cflow & fl_end_block) || uae_host_opcode_reserved(opcode);
 }
 
 #ifdef _WIN32

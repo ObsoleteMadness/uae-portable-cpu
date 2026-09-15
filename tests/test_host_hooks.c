@@ -31,6 +31,7 @@ enum {
 };
 
 static uint8_t s_ram[RAM_SIZE];
+static bool s_jit_follow_cacr;  /* boot() option for the CACR-gated JIT scenario */
 static uae_cpu_t *s_cpu;
 static int s_failures;
 
@@ -192,11 +193,19 @@ static void boot(uae_cpu_type_t cpu_type, const uint16_t *code, size_t words)
     cfg.fpu_type = UAE_FPU_NONE;
     cfg.fpu_softfloat = true;
     cfg.unmapped_bus_error = true;
+    /* UAE_TEST_JIT=1 runs every 68020+ scenario through the JIT. */
+    if (getenv("UAE_TEST_JIT")) {
+        cfg.jit_enabled = true;
+        cfg.jit_cache_size = 8192;
+        cfg.jit_follow_cacr = s_jit_follow_cacr;
+    }
     uae_cpu_set_config(s_cpu, &cfg);
 
     memset(s_ram, 0, sizeof(s_ram));
     memset(&R, 0, sizeof(R));
     uae_cpu_map_ram(s_cpu, 0, RAM_SIZE, s_ram);
+    /* RAM starts at guest 0, so the buffer itself is the flat JIT window. */
+    uae_cpu_set_jit_memory_base(s_cpu, s_ram);
 
     w32(0x0, 0x80000);
     w32(0x4, 0x1000);
@@ -417,6 +426,105 @@ static void test_mem_flags(void)
     uae_cpu_unmap_memory(s_cpu, DEVICE_ADDR, 0x10000);
 }
 
+/*
+ * Translated memory access and flag-heavy arithmetic, checked against a
+ * reference computed in C. Four passes over 16 KB: byte reads, byte / word /
+ * long writes, EOR / ROL / ADD / SUBQ / BNE / DBF, then a long read. This
+ * would have caught the JIT calling the wrong addrbank accessor.
+ */
+static void test_translated_memory_loops(void)
+{
+    static const uint16_t code[] = {
+        0x7000, 0x7400,                 /* MOVEQ #0,D0; MOVEQ #0,D2           */
+        0x3E3C, 0x0003,                 /* MOVE.W #3,D7          (4 passes)   */
+        0x43F9, 0x000A, 0x0000,         /* LEA $A0000,A1                      */
+        0x41F9, 0x0008, 0x0000,         /* outer: LEA $80000,A0               */
+        0x263C, 0x0000, 0x4000,         /* MOVE.L #$4000,D3                   */
+        0x1218,                         /* inner: MOVE.B (A0)+,D1             */
+        0xB300,                         /* EOR.B D1,D0                        */
+        0xE798,                         /* ROL.L #3,D0                        */
+        0xD481,                         /* ADD.L D1,D2                        */
+        0x12C1,                         /* MOVE.B D1,(A1)+                    */
+        0x5383,                         /* SUBQ.L #1,D3                       */
+        0x66F2,                         /* BNE inner                          */
+        0x22C0,                         /* MOVE.L D0,(A1)+                    */
+        0x32C2,                         /* MOVE.W D2,(A1)+                    */
+        0x51CF, 0xFFE0,                 /* DBF D7,outer                       */
+        0x2839, 0x000A, 0x0000,         /* MOVE.L $A0000,D4                   */
+        OP_EXEC_RETURN
+    };
+    static uint8_t ref[4 * (0x4000 + 6)];
+    uint32_t d0 = 0, d1 = 0, d2 = 0, d4;
+    size_t o = 0;
+
+    printf("[*] translated memory loops match the C reference\n");
+    for (int pass = 0; pass < 4; pass++) {
+        for (uint32_t i = 0; i < 0x4000; i++) {
+            uint8_t b = (uint8_t)(i * 131 + 7);
+            d1 = (d1 & ~0xFFu) | b;
+            d0 = (d0 & ~0xFFu) | ((d0 ^ d1) & 0xFF);
+            d0 = (d0 << 3) | (d0 >> 29);
+            d2 += d1;
+            ref[o++] = b;
+        }
+        ref[o++] = (uint8_t)(d0 >> 24); ref[o++] = (uint8_t)(d0 >> 16);
+        ref[o++] = (uint8_t)(d0 >> 8);  ref[o++] = (uint8_t)d0;
+        ref[o++] = (uint8_t)(d2 >> 8);  ref[o++] = (uint8_t)d2;
+    }
+    d4 = ((uint32_t)ref[0] << 24) | ((uint32_t)ref[1] << 16) | ((uint32_t)ref[2] << 8) | ref[3];
+
+    boot(UAE_CPU_TYPE_68020, code, sizeof(code) / sizeof(code[0]));
+    for (uint32_t i = 0; i < 0x4000; i++)
+        s_ram[0x80000 + i] = (uint8_t)(i * 131 + 7);
+    for (int pass = 0; pass < 50 && reg(UAE_REG_PC) != 0x1038; pass++)
+        uae_cpu_execute(s_cpu, 1000000);
+
+    CHECK(reg(UAE_REG_PC) == 0x1038);
+    CHECK(reg(UAE_REG_D0) == d0);
+    CHECK(reg(UAE_REG_D1) == d1);
+    CHECK(reg(UAE_REG_D2) == d2);
+    CHECK(reg(UAE_REG_D4) == d4);
+    CHECK(memcmp(s_ram + 0xA0000, ref, sizeof(ref)) == 0);
+    if (getenv("UAE_TEST_JIT"))
+        CHECK(uae_cpu_get_jit_code_size(s_cpu) > 0);
+}
+
+static void test_jit_compiles(void)
+{
+    /* MOVEQ #0,D0; MOVE.W #999,D1; loop: ADDQ.L #1,D0; DBRA D1,loop; exec return */
+    static const uint16_t code[] = { 0x7000, 0x323C, 0x03E7, 0x5280, 0x51C9, 0xFFFC, OP_EXEC_RETURN };
+    uae_cpu_host_hooks_t hooks;
+
+    printf("[*] JIT smoke: loop result and translated code\n");
+    boot(UAE_CPU_TYPE_68020, code, 7);
+    /* Keep only the exec-return trap: without dbf_spin, DBRA compiles natively. */
+    memset(&hooks, 0, sizeof(hooks));
+    hooks.illegal = on_illegal;
+    uae_cpu_set_host_hooks(s_cpu, &hooks);
+    for (int pass = 0; pass < 20 && reg(UAE_REG_PC) != 0x100E; pass++)
+        uae_cpu_execute(s_cpu, 100000);
+    CHECK(reg(UAE_REG_D0) == 1000);
+    CHECK((reg(UAE_REG_D1) & 0xFFFF) == 0xFFFF);
+    CHECK(reg(UAE_REG_PC) == 0x100E);
+    if (getenv("UAE_TEST_JIT"))
+        CHECK(uae_cpu_get_jit_code_size(s_cpu) > 0);
+    else
+        CHECK(uae_cpu_get_jit_code_size(s_cpu) == 0);
+
+    if (!getenv("UAE_TEST_JIT"))
+        return;
+
+    printf("[*] JIT smoke: jit_follow_cacr waits for the guest to enable the cache\n");
+    s_jit_follow_cacr = true;
+    boot(UAE_CPU_TYPE_68020, code, 7);
+    s_jit_follow_cacr = false;
+    uae_cpu_set_host_hooks(s_cpu, &hooks);
+    for (int pass = 0; pass < 20 && reg(UAE_REG_PC) != 0x100E; pass++)
+        uae_cpu_execute(s_cpu, 100000);
+    CHECK(reg(UAE_REG_D0) == 1000);
+    CHECK(uae_cpu_get_jit_code_size(s_cpu) == 0);
+}
+
 int main(void)
 {
     uae_cpu_global_init();
@@ -434,6 +542,8 @@ int main(void)
     test_get_irq();
     test_reserved_opcodes();
     test_mem_flags();
+    test_translated_memory_loops();
+    test_jit_compiles();
 
     uae_cpu_destroy(s_cpu);
     if (s_failures) {

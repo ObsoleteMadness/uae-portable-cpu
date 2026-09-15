@@ -3,6 +3,7 @@
  */
 
 #include "m68k.h"
+#include "uae_cpu.h"
 #include <assert.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -295,6 +296,28 @@ static void setup_bootsec(void) {
     m68k_write_memory_32(4, 0x10000);
 }
 
+/*
+ * UAE_TEST_JIT=1: after the Musashi-compatible setup, reconfigure the same
+ * CPU through the context API with the JIT enabled, so 68020+ fixtures run
+ * as translated code.
+ */
+static void apply_test_jit(unsigned int cpu_type) {
+    uae_cpu_config_t cfg;
+    if (!getenv("UAE_TEST_JIT"))
+        return;
+    memset(&cfg, 0, sizeof(cfg));
+    switch (cpu_type) {
+    case M68K_CPU_TYPE_68020: cfg.cpu_type = UAE_CPU_TYPE_68020; cfg.fpu_type = UAE_FPU_68881; break;
+    case M68K_CPU_TYPE_68030: cfg.cpu_type = UAE_CPU_TYPE_68030; cfg.fpu_type = UAE_FPU_68882; break;
+    case M68K_CPU_TYPE_68040: cfg.cpu_type = UAE_CPU_TYPE_68040; cfg.fpu_type = UAE_FPU_68040; break;
+    default: return;  /* the JIT needs a 68020 or later */
+    }
+    cfg.fpu_softfloat = true;
+    cfg.jit_enabled = true;
+    cfg.jit_cache_size = 8192;
+    uae_cpu_set_config(NULL, &cfg);
+}
+
 static int run_single_test(const char* bin_path, unsigned int cpu_type, int verbose) {
     FILE *infile = fopen(bin_path, "rb");
     if (!infile) {
@@ -311,6 +334,7 @@ static int run_single_test(const char* bin_path, unsigned int cpu_type, int verb
 
     m68k_init();
     m68k_set_cpu_type(cpu_type);
+    apply_test_jit(cpu_type);
 
     test_device_init(&g_test_dev);
     setup_memory();
