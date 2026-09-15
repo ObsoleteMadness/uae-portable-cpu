@@ -11,6 +11,7 @@
 #include "fpp.h"
 #include "disasm.h"
 #include "uae_cpu.h"
+#include "host_hooks.h"
 
 struct uae_cpu_instance {
     uae_cpu_config_t config;
@@ -65,6 +66,7 @@ void uae_cpu_set_config(uae_cpu_t *cpu, const uae_cpu_config_t *config) {
     currprefs.cpu_cycle_exact = (config->timing_mode >= 2);
     currprefs.fpu_mode = config->fpu_softfloat ? 0 : 1;
     currprefs.cachesize = config->jit_enabled ? config->jit_cache_size : 0;
+    g_unmapped_bus_error = config->unmapped_bus_error;
 
     changed_prefs = currprefs;
     fixup_cpu(&currprefs);
@@ -90,67 +92,12 @@ void uae_cpu_reset(uae_cpu_t *cpu) {
 
 int uae_cpu_step(uae_cpu_t *cpu) {
     (void)cpu;
-    evt_t start = currcycle;
-    if (regs.spcflags) {
-        if (do_specialties(0))
-            return 0;
-    }
-
-    if (g_instr_hook) {
-        g_instr_hook(g_instr_userdata, m68k_getpc());
-    }
-
-    uae_u16 opcode;
-    if (currprefs.cpu_compatible) {
-        if (currprefs.cpu_model <= 68010)
-            opcode = regs.ir;
-        else
-            opcode = regs.irc;
-    } else {
-        opcode = get_iword(0);
-    }
-    regs.opcode = opcode;
-    regs.instruction_pc = m68k_getpc();
-
-    int cycles = (*cpufunctbl[opcode])(opcode) & 0xFFFF;
-    cycles = adjust_cycles(cycles);
-    do_cycles(cycles);
-    regs.instruction_cnt++;
-
-    return (int)((currcycle - start) / CYCLE_UNIT);
+    return uae_host_step();
 }
 
 int uae_cpu_execute(uae_cpu_t *cpu, int cycles) {
     (void)cpu;
-    evt_t start = currcycle;
-    evt_t target = start + (evt_t)cycles * CYCLE_UNIT;
-
-    while (currcycle < target && !regs.stopped && !regs.halted) {
-        if (regs.spcflags) {
-            if (do_specialties(0))
-                break;
-        }
-
-        if (g_instr_hook) {
-            g_instr_hook(g_instr_userdata, m68k_getpc());
-        }
-
-        uae_u16 opcode;
-        if (currprefs.cpu_compatible && currprefs.cpu_model <= 68010) {
-            opcode = regs.ir;
-        } else {
-            opcode = x_get_iword(0);
-        }
-        int cyc = (*cpufunctbl[opcode])(opcode) & 0xFFFF;
-        if (cyc == 0) {
-            cyc = (CurrentInstrCycles > 0 ? CurrentInstrCycles : 4) * (CYCLE_UNIT / 2);
-        }
-        cyc = adjust_cycles(cyc);
-        do_cycles(cyc);
-        regs.instruction_cnt++;
-    }
-
-    return (int)((currcycle - start) / CYCLE_UNIT);
+    return uae_host_run(cycles);
 }
 
 bool uae_cpu_is_stopped(uae_cpu_t *cpu) {
@@ -165,6 +112,7 @@ bool uae_cpu_is_halted(uae_cpu_t *cpu) {
 
 void uae_cpu_set_irq(uae_cpu_t *cpu, int level) {
     (void)cpu;
+    /* Safe from another thread: an int store plus an atomic spcflags OR. */
     pending_irq_level = level & 0x7;
     if (pending_irq_level > 0) {
         set_special(SPCFLAG_INT);
@@ -428,4 +376,58 @@ int uae_cpu_disassemble(uae_cpu_t *cpu, uint32_t pc, char *output_str, size_t ma
     uaecptr nextpc = pc;
     m68k_disasm_2(output_str, (int)maxlen, pc, NULL, 0, &nextpc, 1, NULL, NULL, pc, 0);
     return (int)(nextpc - pc);
+}
+
+void uae_cpu_set_host_hooks(uae_cpu_t *cpu, const uae_cpu_host_hooks_t *hooks) {
+    (void)cpu;
+    uae_host_set_hooks(hooks);
+}
+
+int uae_cpu_reserve_opcodes(uae_cpu_t *cpu, uint16_t first, uint16_t last) {
+    (void)cpu;
+    return uae_host_reserve_opcodes(first, last);
+}
+
+void uae_cpu_clear_reserved_opcodes(uae_cpu_t *cpu) {
+    (void)cpu;
+    uae_host_clear_reserved_opcodes();
+}
+
+void uae_cpu_end_timeslice(uae_cpu_t *cpu) {
+    (void)cpu;
+    /* Consumed by the innermost do_specialties(), so only that loop returns. */
+    set_special(SPCFLAG_BRK);
+}
+
+int uae_cpu_execute_depth(uae_cpu_t *cpu) {
+    (void)cpu;
+    return g_execute_depth;
+}
+
+void uae_cpu_signal_irq(uae_cpu_t *cpu) {
+    (void)cpu;
+    set_special(SPCFLAG_INT);
+}
+
+uint64_t uae_cpu_get_cycles(uae_cpu_t *cpu) {
+    (void)cpu;
+    return currcycle > 0 ? (uint64_t)(currcycle / CYCLE_UNIT) : 0;
+}
+
+void uae_cpu_raise_bus_error(uae_cpu_t *cpu, uint32_t addr, bool is_write, int size) {
+    (void)cpu;
+    uae_host_raise_bus_error(addr, is_write, size);
+}
+
+void uae_cpu_invalidate_code(uae_cpu_t *cpu, uint32_t addr, uint32_t size) {
+    /* The JIT backends are not part of this build, so there is no translated
+     * code to discard. The entry point exists so hosts can call it unconditionally. */
+    (void)cpu;
+    (void)addr;
+    (void)size;
+}
+
+uint32_t uae_cpu_get_mem_flags(uae_cpu_t *cpu, uint32_t addr) {
+    (void)cpu;
+    return memory_host_flags(addr);
 }

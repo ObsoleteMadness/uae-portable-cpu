@@ -8065,6 +8065,14 @@ bccl_not68020:
 			write_return_cycles(0);
 			out("}\n");
 		}
+		// Host hook: collapse DBF Dn,*-2 delay loops. Fast tables only: prefetch,
+		// cycle-exact, MMU and test cores keep literal instruction semantics.
+		if (curi->cc == 1 && !using_prefetch && !using_prefetch_020 && !using_ce && !using_ce020 && !using_mmu && !using_test) {
+			out("if (offs == -2 && uae_host_dbf_spin((int)srcreg)) {\n");
+			setpc("oldpc + %d", m68k_pc_offset);
+			returncycles(14);
+			out("}\n");
+		}
 		push_ins_cnt();
 		out("if (!cctrue(%d)) {\n", curi->cc);
 		incpc ("(uae_s32)offs + 2");

@@ -20,6 +20,7 @@ All Amiga- and Atari ST-specific hardware dependencies, custom chipset logic, fl
 - **Dual C APIs**:
   1. **Musashi-Compatible C API (`include/m68k.h`)**: Drop-in replacement for emulators already using Musashi.
   2. **Multi-Instance Context API (`include/uae_cpu.h`)**: Re-entrant, multi-instance CPU context model inspired by `m68k-rs` for running multiple independent 68k cores concurrently.
+- **Host Hooks**: Emulator-neutral hooks for host-trap opcodes, Line-A/Line-F interception, TRAP #n, exception observation, pulled interrupts, busy-wait loops and instruction-aborting bus errors. See [HOST_HOOKS.md](HOST_HOOKS.md).
 - **Comprehensive Verification**: Validated against the test suites of Musashi, `m68k-rs`, and native UAE CPU tests.
 
 ---
@@ -43,6 +44,7 @@ uae-portable-cpu/
 │       ├── fpp.c / softfloat # SoftFloat FPU emulation & math tables
 │       ├── memory.c / .h     # Memory interface & callback router
 │       ├── uae_glue.c / .h   # Minimal portable hardware glue layer
+│       ├── host_hooks.c / .h # Host hook dispatch and re-entrant execute loop
 │       └── jit/              # JIT compilers
 │           ├── arm/          # ARM64 (AArch64) JIT backend
 │           └── x86/          # x86 / x86_64 JIT backend
@@ -54,6 +56,7 @@ uae-portable-cpu/
 │   └── fixtures/             # Binary test fixtures (Musashi, m68k-rs, UAE)
 ├── CMakeLists.txt            # CMake build definition
 ├── WALKTHROUGH.md            # Detailed architecture walkthrough & gap analysis
+├── HOST_HOOKS.md             # Host hook contracts for embedding emulators
 └── README.md
 ```
 
@@ -80,6 +83,14 @@ ctest --test-dir build --output-on-failure
 # Install library and CMake config files
 cmake --install build --prefix /usr/local
 ```
+
+### Build Options
+
+| Option | Default | Effect |
+| :--- | :--- | :--- |
+| `ENABLE_TESTS` | `ON` | Build the test executables and register them with CTest |
+| `UAE_CPU_MUSASHI_API` | `ON` | Build the Musashi-compatible `m68k_*` API. Turn off when the host also links Musashi |
+| `UAE_CPU_ISOLATE_SYMBOLS` | `OFF` | Also build `uaecpu_isolated`, a static library exporting only the public API (Apple ld or GNU ld + objcopy; not MSVC). Adds the `isolated_link` test |
 
 ---
 
@@ -118,7 +129,7 @@ vcpkg install --overlay-ports=ports/uae-portable-cpu uae-portable-cpu
 
 ## Test Verification Matrix
 
-All 6 test suites pass via `ctest`:
+All 7 test suites pass via `ctest`:
 
 | Test Target | Description | Pass Rate | Status |
 | :--- | :--- | :--- | :--- |
@@ -128,6 +139,7 @@ All 6 test suites pass via `ctest`:
 | **`musashi_68040`** | Musashi 68040 test suite | 16 / 18 (88.9%)* | **PASSED** |
 | **`m68k_rs_coverage`** | `m68k-rs` comprehensive instruction coverage | 25 / 25 (100%) | **PASSED** |
 | **`m68k_rs_extra`** | `m68k-rs` extended instruction test fixtures | 102 / 127 (80.3%) | **PASSED** |
+| **`host_hooks`** | Host hook contracts: traps, Line-A/F, TRAP #n, exceptions, IRQ, DBF spin, bus errors, reserved opcodes, memory flags | 100% | **PASSED** |
 
 *\* For detailed analysis of the subtle differences between Musashi's test fixtures and Motorola silicon behavior (such as BCD arithmetic on invalid non-decimal inputs and division overflow CCR flag status), see [WALKTHROUGH.md](WALKTHROUGH.md).*
 
@@ -247,6 +259,26 @@ int main(void) {
     return 0;
 }
 ```
+
+### 3. Host Hooks
+
+Hosts that service guest calls themselves (trap tables, HLE, paravirtual devices) install hooks instead of patching the core:
+
+```c
+static int on_illegal(void *ud, uint16_t opcode, uint32_t pc) {
+    if (opcode == 0x7100) {              /* host-defined trap */
+        uae_cpu_end_timeslice(ud);       /* return to the host */
+        return 1;                        /* handled: resume at pc + 2 */
+    }
+    return 0;                            /* take vector 4 */
+}
+
+uae_cpu_host_hooks_t hooks = { .userdata = cpu, .illegal = on_illegal };
+uae_cpu_set_host_hooks(cpu, &hooks);
+uae_cpu_reserve_opcodes(cpu, 0x7100, 0x713F);
+```
+
+See [HOST_HOOKS.md](HOST_HOOKS.md) for every hook and its contract.
 
 ---
 

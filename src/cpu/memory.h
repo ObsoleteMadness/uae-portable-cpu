@@ -27,6 +27,7 @@ typedef int (REGPARAM3 *check_func)(uaecptr, uae_u32) REGPARAM;
 #define ABFLAG_NONE 16
 #define ABFLAG_SAFE 32
 #define ABFLAG_DIRECTMAP 1024
+#define ABFLAG_JIT_UNSAFE_BURST 0x10000
 
 enum {
     CE_MEMBANK_NONE,
@@ -46,6 +47,9 @@ typedef struct addrbank {
     uae_u8 *baseaddr;
     uae_u32 mask;
     uae_u32 flags;
+    uae_u32 host_flags;      /* uae_mem_flags_t bits given when mapped */
+    uae_u32 jit_read_flag;   /* 0 = JIT may read directly, S_READ = via helper */
+    uae_u32 jit_write_flag;  /* 0 = JIT may write directly, S_WRITE = via helper */
     void *userdata;
 
     /* Custom device callbacks if mapped via custom API */
@@ -85,6 +89,7 @@ int  memory_map_custom(uint32_t start_addr, uint32_t size,
                        uae_write8_fn w8, uae_write16_fn w16, uae_write32_fn w32,
                        void *userdata);
 void memory_unmap(uint32_t start_addr, uint32_t size);
+uint32_t memory_host_flags(uint32_t addr);
 
 /* Bank Lookup */
 #define get_mem_bank(addr) (*mem_banks[((addr) >> 16) & 0xFFFF])

@@ -25,6 +25,7 @@
 #include "options_cpu.h"
 #include "memory.h"
 #include "newcpu.h"
+#include "host_hooks.h"
 #include "fpp.h"
 #include "savestate.h"
 #include "cpummu030.h"
@@ -1071,6 +1072,18 @@ static void fp_unimp_datatype(uae_u16 opcode, uae_u16 extra, uae_u32 ea, bool ea
 
 static void fpu_op_illg(uae_u16 opcode, uae_u32 ea, bool easet, uaecptr oldpc)
 {
+	/* The host may emulate or skip an FPU instruction this CPU cannot run. */
+	if (g_host_hooks.fline) {
+		uaecptr cur = m68k_getpc();
+		m68k_setpc(oldpc);
+		if (uae_host_call_fline(opcode, oldpc,
+			((regs.pcr & 2) || currprefs.fpu_model <= 0) ? UAE_FLINE_FPU_ABSENT : UAE_FLINE_UNKNOWN)) {
+			if (m68k_getpc() == oldpc)
+				m68k_setpc(oldpc + 2);
+			return;
+		}
+		m68k_setpc(cur);
+	}
 	if ((currprefs.cpu_model == 68060 && (currprefs.fpu_model == 0 || (regs.pcr & 2)))
 		|| (currprefs.cpu_model == 68040 && currprefs.fpu_model == 0)) {
 			regs.fp_unimp_ins  = true;
@@ -1082,6 +1095,7 @@ static void fpu_op_illg(uae_u16 opcode, uae_u32 ea, bool easet, uaecptr oldpc)
 	}
 	regs.fp_exception = true;
 	m68k_setpc(oldpc);
+	g_host_fline_consulted = 1;
 	op_illg(opcode);
 }
 

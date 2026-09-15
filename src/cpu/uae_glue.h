@@ -16,7 +16,7 @@ extern "C" {
 #endif
 
 extern int pendingInterrupts;
-extern int pending_irq_level;
+extern volatile int pending_irq_level;
 extern FILE *TraceFile;
 extern uint64_t CyclesGlobalClockCounter;
 extern int BlitterPhase;

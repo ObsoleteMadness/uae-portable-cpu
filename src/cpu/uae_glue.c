@@ -7,6 +7,7 @@
 #include "uae_glue.h"
 #include "memory.h"
 #include "newcpu.h"
+#include "host_hooks.h"
 #include <stdio.h>
 #include <stdarg.h>
 
@@ -14,7 +15,7 @@ struct uae_prefs currprefs;
 struct uae_prefs changed_prefs;
 
 int pendingInterrupts = 0;
-int pending_irq_level = 0;
+volatile int pending_irq_level = 0;
 FILE *TraceFile = NULL;
 uint64_t CyclesGlobalClockCounter = 0;
 int BlitterPhase = 0;
@@ -39,6 +40,9 @@ void          *g_trap_userdata = NULL;
 
 int intlev(void)
 {
+    /* A host that installed get_irq owns the interrupt level. */
+    if (g_host_hooks.get_irq)
+        return g_host_hooks.get_irq(g_host_hooks.userdata) & 7;
     if (pending_irq_level > 0)
         return pending_irq_level;
     for (int i = 7; i >= 1; i--) {

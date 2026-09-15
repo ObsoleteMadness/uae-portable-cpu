@@ -8,6 +8,8 @@
 #include "maccess.h"
 #include "memory.h"
 #include "newcpu.h"
+#include "host_hooks.h"
+#include "readcpu.h"
 #include "m68k.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -23,6 +25,7 @@ uae_u8 ce_banktype[65536] = {0};
 uae_test_device_t g_test_device = {0, 0, 0};
 bool g_musashi_mode = false;
 
+#if UAE_CPU_HAS_MUSASHI_API
 /* Weak default callbacks for Musashi API (overridden when using Musashi API) */
 #if defined(__GNUC__) || defined(__clang__)
 __attribute__((weak)) unsigned int m68k_read_memory_8(unsigned int address) { (void)address; return 0; }
@@ -46,45 +49,77 @@ void default_m68k_write_memory_8(unsigned int address, unsigned int value) { (vo
 void default_m68k_write_memory_16(unsigned int address, unsigned int value) { (void)address; (void)value; }
 void default_m68k_write_memory_32(unsigned int address, unsigned int value) { (void)address; (void)value; }
 #endif
+#endif /* UAE_CPU_HAS_MUSASHI_API */
 
-/* Dummy Bank Handlers (Default / Unmapped) */
+/*
+ * Dummy Bank Handlers (Default / Unmapped)
+ *
+ * In Musashi-compatible mode every unmapped bank forwards to the host's
+ * m68k_read/write_memory_* callbacks. Otherwise unmapped reads float high,
+ * and when unmapped_bus_error is configured the access aborts the current
+ * instruction with a bus error instead.
+ */
 static uae_u32 REGPARAM3 dummy_lget(uaecptr addr) REGPARAM {
+#if UAE_CPU_HAS_MUSASHI_API
     if (g_musashi_mode) {
         return m68k_read_memory_32(addr);
     }
+#endif
+    if (g_unmapped_bus_error) uae_host_raise_bus_error(addr, false, 4);
     return 0xFFFFFFFF;
 }
 
 static uae_u32 REGPARAM3 dummy_wget(uaecptr addr) REGPARAM {
+#if UAE_CPU_HAS_MUSASHI_API
     if (g_musashi_mode) {
         return m68k_read_memory_16(addr);
     }
+#endif
+    if (g_unmapped_bus_error) uae_host_raise_bus_error(addr, false, 2);
     return 0xFFFF;
 }
 
 static uae_u32 REGPARAM3 dummy_bget(uaecptr addr) REGPARAM {
+#if UAE_CPU_HAS_MUSASHI_API
     if (g_musashi_mode) {
         return m68k_read_memory_8(addr);
     }
+#endif
+    if (g_unmapped_bus_error) uae_host_raise_bus_error(addr, false, 1);
     return 0xFF;
 }
 
 static void REGPARAM3 dummy_lput(uaecptr addr, uae_u32 l) REGPARAM {
+#if UAE_CPU_HAS_MUSASHI_API
     if (g_musashi_mode) {
         m68k_write_memory_32(addr, l);
+        return;
     }
+#endif
+    (void)l;
+    if (g_unmapped_bus_error) uae_host_raise_bus_error(addr, true, 4);
 }
 
 static void REGPARAM3 dummy_wput(uaecptr addr, uae_u32 w) REGPARAM {
+#if UAE_CPU_HAS_MUSASHI_API
     if (g_musashi_mode) {
         m68k_write_memory_16(addr, w);
+        return;
     }
+#endif
+    (void)w;
+    if (g_unmapped_bus_error) uae_host_raise_bus_error(addr, true, 2);
 }
 
 static void REGPARAM3 dummy_bput(uaecptr addr, uae_u32 b) REGPARAM {
+#if UAE_CPU_HAS_MUSASHI_API
     if (g_musashi_mode) {
         m68k_write_memory_8(addr, b);
+        return;
     }
+#endif
+    (void)b;
+    if (g_unmapped_bus_error) uae_host_raise_bus_error(addr, true, 1);
 }
 
 static int REGPARAM3 dummy_check(uaecptr addr, uae_u32 size) REGPARAM {
@@ -97,6 +132,7 @@ static uae_u8 *REGPARAM3 dummy_xlate(uaecptr addr) REGPARAM {
     return NULL;
 }
 
+#if UAE_CPU_HAS_MUSASHI_API
 /* Musashi Direct Bridge Handlers */
 static uae_u32 REGPARAM3 musashi_lget(uaecptr addr) REGPARAM {
     return m68k_read_memory_32(addr);
@@ -116,6 +152,16 @@ static void REGPARAM3 musashi_wput(uaecptr addr, uae_u32 w) REGPARAM {
 static void REGPARAM3 musashi_bput(uaecptr addr, uae_u32 b) REGPARAM {
     m68k_write_memory_8(addr, b);
 }
+
+#else
+/* Without the Musashi API the bridge bank behaves like the dummy bank. */
+#define musashi_lget dummy_lget
+#define musashi_wget dummy_wget
+#define musashi_bget dummy_bget
+#define musashi_lput dummy_lput
+#define musashi_wput dummy_wput
+#define musashi_bput dummy_bput
+#endif
 
 /* Direct RAM Bank Handlers */
 static uae_u32 REGPARAM3 ram_lget(uaecptr addr) REGPARAM {
@@ -291,6 +337,8 @@ void memory_init(void) {
     dummy_bank.xlateaddr = dummy_xlate;
     dummy_bank.check = dummy_check;
     dummy_bank.flags = ABFLAG_NONE;
+    dummy_bank.jit_read_flag = S_READ;
+    dummy_bank.jit_write_flag = S_WRITE;
 
     memset(&musashi_bridge_bank, 0, sizeof(musashi_bridge_bank));
     musashi_bridge_bank.name = "musashi";
@@ -377,6 +425,12 @@ int memory_map_ptr(uint32_t start_addr, uint32_t size, uint8_t *host_ptr, uint32
     bank->baseaddr = host_ptr;
     bank->mask = size - 1;
     bank->flags = ABFLAG_RAM | ((flags & UAE_MEM_ROM) ? ABFLAG_ROM : 0);
+    bank->host_flags = flags;
+    /* Only regions the host declared JIT-direct may be accessed inline; ROM writes never are. */
+    bank->jit_read_flag = (flags & UAE_MEM_JIT_DIRECT) ? 0 : S_READ;
+    bank->jit_write_flag = ((flags & UAE_MEM_JIT_DIRECT) && !(flags & UAE_MEM_ROM)) ? 0 : S_WRITE;
+    if (flags & UAE_MEM_JIT_UNSAFE_BURST)
+        bank->flags |= ABFLAG_JIT_UNSAFE_BURST;
 
     for (int i = 0; i < num_banks; i++) {
         int idx = (start_bank + i) & 0xFFFF;
@@ -407,6 +461,9 @@ int memory_map_custom(uint32_t start_addr, uint32_t size,
     bank->xlateaddr = dummy_xlate;
     bank->check = dummy_check;
     bank->flags = ABFLAG_IO;
+    bank->host_flags = UAE_MEM_IO;
+    bank->jit_read_flag = S_READ;
+    bank->jit_write_flag = S_WRITE;
     bank->r8 = r8;
     bank->r16 = r16;
     bank->r32 = r32;
@@ -450,4 +507,19 @@ void memory_unmap(uint32_t start_addr, uint32_t size) {
             free(bank_to_free);
         }
     }
+}
+
+/*
+ * Reports how the region containing addr was mapped.
+ *
+ * Arguments:
+ *   addr: Guest address.
+ *
+ * Returns:
+ *   uae_mem_flags_t bits given to memory_map_ptr / memory_map_custom, or 0
+ *   for an unmapped bank.
+ */
+uint32_t memory_host_flags(uint32_t addr) {
+    addrbank *bank = mem_banks[(addr >> 16) & 0xFFFF];
+    return bank ? bank->host_flags : 0;
 }
