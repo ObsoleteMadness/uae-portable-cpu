@@ -22,8 +22,10 @@
  * special_mem collects the jit_read_flag / jit_write_flag of every bank an
  * instruction touched while a block was being profiled, so accesses to
  * indirect (IO) regions compile as helper calls. canbang enables direct
- * host-pointer access through natmem_offset; while it is false every
- * compiled memory access goes through the bank handlers.
+ * host-pointer access through natmem_offset (uae_cpu_config_t
+ * jit_direct_memory); while it is false every compiled memory access goes
+ * through the bank handlers. memory_jit_sync_all() recomputes the per-bank
+ * flags when the map, the base or canbang changes.
  */
 extern int special_mem;
 extern int special_mem_default;
@@ -34,6 +36,7 @@ extern bool jit_direct_compatible_memory;
 extern uae_u8 *natmem_offset;
 extern uae_u8 *natmem_reserved;
 extern size_t natmem_reserved_size;
+void memory_jit_sync_all(void);
 #endif
 
 typedef uae_u32 (REGPARAM3 *mem_get_func)(uaecptr) REGPARAM;

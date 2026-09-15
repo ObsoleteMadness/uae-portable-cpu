@@ -13,6 +13,11 @@
 #endif
 #include <signal.h>
 
+/* glibc: uc_mcontext.gregs[REG_RIP] (g++ defines _GNU_SOURCE). */
+#if defined(__linux__) && !defined(HAVE_STRUCT_UCONTEXT_UC_MCONTEXT_GREGS)
+#define HAVE_STRUCT_UCONTEXT_UC_MCONTEXT_GREGS 1
+#endif
+
 #define SIG_READ 1
 #define SIG_WRITE 2
 
@@ -387,8 +392,18 @@ static void log_unhandled_access(uae_u8 *fault_pc)
 	}
 }
 
-#ifdef WIN32
+#if defined(WIN32) || defined(CPU_x86_64)
 
+/*
+ * Completes a faulting direct access in place: the value is read into (or
+ * taken from) the register in the saved context through the region's
+ * handler, the host instruction is skipped and the block is invalidated so
+ * it is profiled again. No code is patched, so this also works when the
+ * translation cache and handler code are more than 2 GB apart.
+ *
+ * The access runs with regs not synced from compiled code, so a handler
+ * must not raise a bus error here (uae_host_raise_bus_error ignores it).
+ */
 static int handle_access(uintptr_t fault_addr, CONTEXT_T context)
 {
 	uae_u8 *fault_pc = (uae_u8 *) CONTEXT_PC(context);
@@ -470,6 +485,7 @@ static int handle_access(uintptr_t fault_addr, CONTEXT_T context)
 		return 1;
 	}
 
+	g_jit_in_fault_recovery = true;
 	if (dir == SIG_READ) {
 		switch (size) {
 		case 1:
@@ -479,7 +495,12 @@ static int handle_access(uintptr_t fault_addr, CONTEXT_T context)
 			*((uae_u16*)pr) = do_byteswap_16(get_word(addr));
 			break;
 		case 4:
+#ifdef CPU_x86_64
+			/* A 32-bit load clears the upper half of the register. */
+			*((uae_u64*)pr) = do_byteswap_32(get_long(addr));
+#else
 			*((uae_u32*)pr) = do_byteswap_32(get_long(addr));
+#endif
 			break;
 		default:
 			abort();
@@ -498,6 +519,7 @@ static int handle_access(uintptr_t fault_addr, CONTEXT_T context)
 		default: abort();
 		}
 	}
+	g_jit_in_fault_recovery = false;
 	CONTEXT_PC(context) += len;
 
 	if (delete_trigger(active, fault_pc)) {
@@ -703,20 +725,39 @@ static LONG CALLBACK JITVectoredHandler(PEXCEPTION_POINTERS info)
 
 #elif defined(HAVE_CONTEXT_T)
 
+static struct sigaction s_prev_sigsegv, s_prev_sigbus;
+
+/*
+ * Passes a fault that is not a direct access from compiled code to the
+ * handler that was installed before the JIT's (the host's own, typically).
+ * With no previous handler the default action is restored and the handler
+ * returns, so the faulting instruction runs again and terminates the process
+ * as it would have without the JIT.
+ */
+static void chain_signal(int signum, siginfo_t *info, void *context)
+{
+	struct sigaction *prev = signum == SIGBUS ? &s_prev_sigbus : &s_prev_sigsegv;
+
+	if (prev->sa_flags & SA_SIGINFO) {
+		if (prev->sa_sigaction) {
+			prev->sa_sigaction(signum, info, context);
+			return;
+		}
+	} else if (prev->sa_handler != SIG_DFL && prev->sa_handler != SIG_IGN) {
+		prev->sa_handler(signum);
+		return;
+	}
+	signal(signum, SIG_DFL);
+}
+
 static void sigsegv_handler(int signum, siginfo_t *info, void *context)
 {
 	uae_u8 *i = (uae_u8 *) CONTEXT_PC(context);
 	uintptr_t address = (uintptr_t) info->si_addr;
 
-	if (i >= compiled_code) {
-		if (handle_access(address, context)) {
-			return;
-		}
-	} else {
-		write_log ("Caught illegal access to %08lx at eip=%p\n", address, i);
-	}
-
-	exit (EXIT_FAILURE);
+	if (i >= compiled_code && handle_access(address, context))
+		return;
+	chain_signal(signum, info, context);
 }
 
 #endif
@@ -727,13 +768,25 @@ static void sigsegv_handler(int signum, siginfo_t *info, void *context)
 #include "test_exception_handler.cpp"
 #endif
 
+/*
+ * Installs the fault handler that recovers direct accesses. Only needed (and
+ * only installed) once direct memory access is on; it is installed once per
+ * process and chains to whatever handler was there before.
+ */
 static void install_exception_handler(void)
 {
+	static bool installed;
+
+	if (!canbang || installed)
+		return;
+	installed = true;
+
 #ifdef TEST_EXCEPTION_HANDLER
 	test_exception_handler();
 #endif
 
-#ifdef JIT_EXCEPTION_HANDLER
+#if defined(JIT_EXCEPTION_HANDLER) && !defined(CPU_x86_64)
+	/* Code-patching recovery (32-bit only). */
 	if (veccode == NULL) {
 		veccode = (uae_u8 *) uae_vm_alloc(256, UAE_VM_32BIT, UAE_VM_READ_WRITE_EXECUTE);
 	}
@@ -755,9 +808,10 @@ static void install_exception_handler(void)
 	act.sa_sigaction = (void (*)(int, siginfo_t*, void*)) sigsegv_handler;
 	sigemptyset (&act.sa_mask);
 	act.sa_flags = SA_SIGINFO;
-	sigaction(SIGSEGV, &act, NULL);
-#ifdef MACOSX
-	sigaction(SIGBUS, &act, NULL);
+	sigaction(SIGSEGV, &act, &s_prev_sigsegv);
+#if defined(MACOSX) || defined(__APPLE__)
+	/* macOS reports access to a PROT_NONE mapping as SIGBUS. */
+	sigaction(SIGBUS, &act, &s_prev_sigbus);
 #endif
 #else
 	write_log (_T("JIT: No segfault handler installed\n"));

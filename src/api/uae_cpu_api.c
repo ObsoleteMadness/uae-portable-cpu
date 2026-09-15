@@ -65,7 +65,8 @@ void uae_cpu_set_config(uae_cpu_t *cpu, const uae_cpu_config_t *config) {
     currprefs.cpu_compatible = (config->timing_mode >= 1);
     currprefs.cpu_cycle_exact = (config->timing_mode >= 2);
     currprefs.fpu_mode = config->fpu_softfloat ? 0 : 1;
-    uae_host_configure_jit(config->jit_enabled, config->jit_cache_size, config->jit_follow_cacr);
+    uae_host_configure_jit(config->jit_enabled, config->jit_cache_size, config->jit_follow_cacr,
+                           config->jit_direct_memory);
     g_unmapped_bus_error = config->unmapped_bus_error;
 
     changed_prefs = currprefs;

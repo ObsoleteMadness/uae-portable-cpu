@@ -120,8 +120,12 @@ extern int64_t g_jit_run_target;
 /* When true, translation follows the guest CACR cache-enable bit (WinUAE). */
 extern bool g_jit_follow_cacr;
 
-/* Applies jit_enabled / jit_cache_size / jit_follow_cacr before the CPU tables are rebuilt. */
-void uae_host_configure_jit(bool enabled, uint32_t cache_kb, bool follow_cacr);
+/* True while the x86-64 JIT fault handler completes a direct access through a
+ * region handler; bus errors cannot be raised from that context. */
+extern bool g_jit_in_fault_recovery;
+
+/* Applies the uae_cpu_config_t JIT settings before the CPU tables are rebuilt. */
+void uae_host_configure_jit(bool enabled, uint32_t cache_kb, bool follow_cacr, bool direct_memory);
 
 /* True when compiled code must call this opcode's C handler (host hooks need it). */
 int uae_host_jit_must_interpret(uint32_t opcode);

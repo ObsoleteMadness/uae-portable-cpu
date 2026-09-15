@@ -211,8 +211,8 @@ cycle-exact, MMU and test cores always execute the loop literally.
 
 | Flag | Meaning |
 |------|---------|
-| `UAE_MEM_JIT_DIRECT` | Reserved for direct (inlined) host memory access from translated code; recorded now, not yet used |
-| `UAE_MEM_JIT_UNSAFE_BURST` | Reserved for direct access: keep MOVEM/MOVE16 bursts on per-access helpers |
+| `UAE_MEM_JIT_DIRECT` | With `jit_direct_memory`: translated code may read and write the region inline, provided its host pointer is `base + start` for the JIT memory base. Otherwise the flag has no effect |
+| `UAE_MEM_JIT_UNSAFE_BURST` | With `jit_direct_memory`: conservative mode for memory maps where a burst (MOVEM, MOVE16) can run off a direct region. Blocks touching handler-backed memory are interpreted, and on x86-64 translated accesses use the handlers |
 
 Custom regions (`uae_cpu_map_custom`) always report `UAE_MEM_IO` and are
 never JIT-direct.
@@ -260,7 +260,8 @@ With `jit_enabled` (see the [README](README.md#3-jit-compiler)), every hook keep
 | `dbf_spin` | While the hook is installed, `DBF Dn` is routed to its C handler so the hook is offered; installing or removing it rebuilds the tables |
 | `exception` | Fires as in the interpreter; `fault_pc` comes from the instruction being dispatched |
 | `get_irq`, `uae_cpu_signal_irq()` | Interrupts are taken at block boundaries |
-| `uae_cpu_raise_bus_error()` | Aborts the instruction from inside translated code through the JIT's bus-error recovery |
+| `uae_cpu_raise_bus_error()` | Aborts the instruction from inside translated code through the JIT's bus-error recovery. Exception: with `jit_direct_memory` on x86-64, a handler reached through fault recovery (an inlined access that hit an inaccessible part of the window) cannot raise one, and the call is ignored |
+| Memory callbacks | Called for every access by default. With `jit_direct_memory`, accesses that profiling saw in `UAE_MEM_JIT_DIRECT` RAM are inlined and never reach a callback |
 | `instruction` hook | Only called for code that runs on the interpreter |
 
 ## Musashi-compatible API
@@ -281,7 +282,11 @@ With `jit_enabled` (see the [README](README.md#3-jit-compiler)), every hook keep
 
 - Hook state is global, like the rest of the core: one CPU per process.
 - The JIT translates only from the flat window set with
-  `uae_cpu_set_jit_memory_base()`, and accesses memory through the bank
-  handlers; the `UAE_MEM_JIT_*` flags are recorded for direct access later.
+  `uae_cpu_set_jit_memory_base()`. Direct memory access (`jit_direct_memory`)
+  needs that window to cover the guest address space, and recovers faults in
+  it only on x86-64.
+- With `jit_direct_memory` on x86-64 the library installs a SIGSEGV (and, on
+  macOS, SIGBUS) handler the first time it builds its tables. Faults outside
+  translated code are passed to the handler that was installed before it.
 - `uae_cpu_raise_bus_error()` only takes effect inside `uae_cpu_execute()`,
   `uae_cpu_step()` or `m68k_execute()`.

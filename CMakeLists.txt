@@ -273,11 +273,20 @@ if(ENABLE_TESTS)
     target_link_libraries(test_host_hooks PRIVATE uaecpu)
     add_test(NAME host_hooks COMMAND test_host_hooks)
 
+    # Throughput benchmark (bench/). The test only checks that every mode
+    # produces the reference results; run uae_cpu_bench directly for timings.
+    add_executable(uae_cpu_bench bench/uae_cpu_bench.c)
+    target_link_libraries(uae_cpu_bench PRIVATE uaecpu)
+    add_test(NAME bench_smoke COMMAND uae_cpu_bench --quick --repeat 1)
+
     if(UAE_CPU_JIT_ENABLED)
         # The same suites again with every 68020+ scenario running under the JIT.
         add_test(NAME test_uae_cpu_jit COMMAND test_uae_cpu)
         add_test(NAME host_hooks_jit COMMAND test_host_hooks)
         set_tests_properties(test_uae_cpu_jit host_hooks_jit PROPERTIES ENVIRONMENT UAE_TEST_JIT=1)
+        # And once more with jit_direct_memory in a 4 GB guest reservation.
+        add_test(NAME host_hooks_jit_direct COMMAND test_host_hooks)
+        set_tests_properties(host_hooks_jit_direct PROPERTIES ENVIRONMENT "UAE_TEST_JIT=1;UAE_TEST_JIT_DIRECT=1")
     endif()
 
     if(UAE_CPU_MUSASHI_API)
@@ -305,6 +314,10 @@ if(ENABLE_TESTS)
             add_test(NAME m68k_rs_coverage_jit COMMAND test_m68k_rs_suite ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/m68k-rs/extra/coverage/bin 68040)
             add_test(NAME m68k_rs_extra_jit COMMAND test_m68k_rs_suite ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/m68k-rs/extra 68040)
             set_tests_properties(musashi_68040_jit m68k_rs_coverage_jit m68k_rs_extra_jit PROPERTIES ENVIRONMENT UAE_TEST_JIT=1)
+            # m68k-rs again with jit_direct_memory: RAM and ROM are accessed inline.
+            add_test(NAME m68k_rs_coverage_jit_direct COMMAND test_m68k_rs_suite ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/m68k-rs/extra/coverage/bin 68040)
+            add_test(NAME m68k_rs_extra_jit_direct COMMAND test_m68k_rs_suite ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/m68k-rs/extra 68040)
+            set_tests_properties(m68k_rs_coverage_jit_direct m68k_rs_extra_jit_direct PROPERTIES ENVIRONMENT "UAE_TEST_JIT=1;UAE_TEST_JIT_DIRECT=1")
         endif()
     endif()
 

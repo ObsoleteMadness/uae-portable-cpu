@@ -12,6 +12,9 @@
 #include "portable_dirent.h"
 #include <sys/types.h>
 #include <sys/stat.h>
+#ifndef _WIN32
+#include <sys/mman.h>
+#endif
 
 unsigned int m68k_read_disassembler_16(unsigned int address) {
     (void)address;
@@ -323,6 +326,7 @@ static void apply_test_jit(unsigned int cpu_type) {
      * so a JIT-vs-interpreter diff compares like with like. */
     cfg.jit_enabled = getenv("UAE_TEST_JIT") != NULL;
     cfg.jit_cache_size = 8192;
+    cfg.jit_direct_memory = cfg.jit_enabled && getenv("UAE_TEST_JIT_DIRECT") != NULL;
     uae_cpu_set_config(NULL, &cfg);
 }
 
@@ -333,25 +337,54 @@ static void apply_test_jit(unsigned int cpu_type) {
  * device and 24-bit mirrors stay on the Musashi-compatible callbacks. ROM is
  * mapped read-only: writes are dropped rather than raising the slot's bus
  * error.
+ *
+ * UAE_TEST_JIT_DIRECT=1 adds jit_direct_memory. Inlined accesses reach
+ * base + any address, so the buffer is then the start of a 4 GB reservation
+ * with only the first JIT_FLAT_SIZE bytes accessible.
  */
 #define JIT_FLAT_SIZE 0x400000
-static uint8_t g_jit_flat[JIT_FLAT_SIZE];
+static uint8_t *g_jit_flat;
+
+static bool alloc_jit_flat(void) {
+    if (g_jit_flat)
+        return true;
+#if !defined(_WIN32) && UINTPTR_MAX > 0xFFFFFFFFu
+    if (getenv("UAE_TEST_JIT_DIRECT")) {
+        int flags = MAP_PRIVATE | MAP_ANON;
+#ifdef MAP_NORESERVE
+        flags |= MAP_NORESERVE;
+#endif
+        void *p = mmap(NULL, (size_t)1 << 32, PROT_NONE, flags, -1, 0);
+        if (p == MAP_FAILED || mprotect(p, JIT_FLAT_SIZE, PROT_READ | PROT_WRITE) != 0)
+            return false;
+        g_jit_flat = (uint8_t *)p;
+        return true;
+    }
+#endif
+    g_jit_flat = (uint8_t *)calloc(1, JIT_FLAT_SIZE);
+    return g_jit_flat != NULL;
+}
 
 static uint64_t g_jit_translated_bytes;  /* summed over fixtures, printed at the end */
 
 static void apply_test_jit_memory(void) {
+    uint32_t direct = getenv("UAE_TEST_JIT_DIRECT") ? UAE_MEM_JIT_DIRECT : 0;
     if (!test_flat_memory())
         return;
-    memset(g_jit_flat, 0, sizeof(g_jit_flat));
+    if (!alloc_jit_flat()) {
+        fprintf(stderr, "Cannot allocate the flat JIT window\n");
+        exit(2);
+    }
+    memset(g_jit_flat, 0, JIT_FLAT_SIZE);
     memcpy(g_jit_flat, g_stack.memory, RAM_SLOT_SIZE);
-    uae_cpu_map_memory(NULL, 0, RAM_SLOT_SIZE, g_jit_flat, UAE_MEM_RAM);
+    uae_cpu_map_memory(NULL, 0, RAM_SLOT_SIZE, g_jit_flat, UAE_MEM_RAM | direct);
     for (unsigned i = 0; i < N_ROMS; ++i) {
         uint32_t base = RAM_SLOT_SIZE + ROM_SLOT_SIZE * i;
         memcpy(g_jit_flat + base, g_roms[i].memory, ROM_SLOT_SIZE);
-        uae_cpu_map_memory(NULL, base, ROM_SLOT_SIZE, g_jit_flat + base, UAE_MEM_ROM);
+        uae_cpu_map_memory(NULL, base, ROM_SLOT_SIZE, g_jit_flat + base, UAE_MEM_ROM | direct);
     }
     memcpy(g_jit_flat + 0x300000, g_extra_ram1.memory, RAM_SLOT_SIZE);
-    uae_cpu_map_memory(NULL, 0x300000, RAM_SLOT_SIZE, g_jit_flat + 0x300000, UAE_MEM_RAM);
+    uae_cpu_map_memory(NULL, 0x300000, RAM_SLOT_SIZE, g_jit_flat + 0x300000, UAE_MEM_RAM | direct);
     uae_cpu_set_jit_memory_base(NULL, g_jit_flat);
 }
 

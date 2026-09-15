@@ -36,6 +36,7 @@ bool g_unmapped_bus_error = false;
 int g_host_fline_consulted = 0;
 bool g_jit_run_active = false;
 bool g_jit_follow_cacr = false;
+bool g_jit_in_fault_recovery = false;
 int64_t g_jit_run_target = 0;
 
 #ifdef JIT
@@ -321,6 +322,9 @@ int uae_host_dbf_spin(int dreg)
 void uae_host_raise_bus_error(uint32_t addr, bool is_write, int size)
 {
     int sz = size >= 4 ? sz_long : (size == 2 ? sz_word : sz_byte);
+    /* Inside a signal handler with compiled-code register state: no unwind. */
+    if (g_jit_in_fault_recovery)
+        return;
     hardware_exception2(addr, 0, !is_write, false, sz);
 }
 
@@ -458,9 +462,12 @@ int uae_host_step(void)
  * builds the tables: build_comp() needs the compiler initialised and the
  * translation cache allocated.
  *
- * Memory is always accessed through the bank handlers (canbang = false), so
- * compiled code honours custom devices, ROM write protection and bus errors
- * for any memory map.
+ * By default compiled code accesses memory through the bank handlers
+ * (canbang = false), so it honours custom devices, ROM write protection and
+ * bus errors for any memory map. direct_memory turns on canbang with fully
+ * trusted access: accesses the profiler saw hitting UAE_MEM_JIT_DIRECT
+ * regions inside the JIT window compile to inline host-pointer access
+ * (see memory_jit_sync_all), everything else keeps the handler call.
  *
  * WinUAE only translates while the guest has enabled the CPU cache through
  * CACR. That suits an Amiga (Kickstart enables it) but not a generic host,
@@ -471,8 +478,9 @@ int uae_host_step(void)
  *   enabled: uae_cpu_config_t.jit_enabled.
  *   cache_kb: Translation cache size in KB; 0 selects 8192.
  *   follow_cacr: uae_cpu_config_t.jit_follow_cacr.
+ *   direct_memory: uae_cpu_config_t.jit_direct_memory.
  */
-void uae_host_configure_jit(bool enabled, uint32_t cache_kb, bool follow_cacr)
+void uae_host_configure_jit(bool enabled, uint32_t cache_kb, bool follow_cacr, bool direct_memory)
 {
     g_jit_follow_cacr = follow_cacr;
 #ifdef JIT
@@ -488,11 +496,12 @@ void uae_host_configure_jit(bool enabled, uint32_t cache_kb, bool follow_cacr)
     }
 
     compiler_init();
-    canbang = false;
-    jit_direct_compatible_memory = false;
+    canbang = direct_memory;
+    jit_direct_compatible_memory = direct_memory;
 
-    changed_prefs.comptrustbyte = changed_prefs.comptrustword = 1;
-    changed_prefs.comptrustlong = changed_prefs.comptrustnaddr = 1;
+    /* 0 = trust (inline where profiling allows), 1 = always call the handlers. */
+    changed_prefs.comptrustbyte = changed_prefs.comptrustword = direct_memory ? 0 : 1;
+    changed_prefs.comptrustlong = changed_prefs.comptrustnaddr = direct_memory ? 0 : 1;
     changed_prefs.compnf = true;
     changed_prefs.compfpu = false;
     changed_prefs.comp_hardflush = false;
@@ -504,6 +513,10 @@ void uae_host_configure_jit(bool enabled, uint32_t cache_kb, bool follow_cacr)
      * from the current one, so present the previously allocated size. */
     currprefs.cachesize = s_jit_cache_kb;
     check_prefs_changed_comp(false);
+    /* check_prefs_changed_comp() derives this from the trust level it had on
+     * entry; recompute it for the level just applied. */
+    special_mem_default = currprefs.comptrustbyte ? (S_READ | S_WRITE | S_N_ADDR) : 0;
+    memory_jit_sync_all();
     s_jit_cache_kb = currprefs.cachesize;
     s_jit_tables_dbf_hook = g_host_hooks.dbf_spin != NULL;
     pissoff_value = pissoff = 0;
@@ -514,6 +527,7 @@ void uae_host_configure_jit(bool enabled, uint32_t cache_kb, bool follow_cacr)
     (void)enabled;
     (void)cache_kb;
     (void)follow_cacr;
+    (void)direct_memory;
     currprefs.cachesize = 0;
 #endif
 }
@@ -627,6 +641,8 @@ int uae_host_set_jit_memory_base(uint8_t *base)
 #ifdef JIT
     if (natmem_offset != base) {
         natmem_offset = base;
+        /* Which regions may be accessed inline depends on the base. */
+        memory_jit_sync_all();
         /* Translations embed host PCs derived from the old base. */
         if (currprefs.cachesize && flush_icache)
             flush_icache(3);

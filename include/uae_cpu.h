@@ -54,8 +54,9 @@ typedef enum {
     UAE_MEM_ROM       = 0x02,
     UAE_MEM_IO        = 0x04,
     UAE_MEM_CACHEABLE = 0x08,
-    UAE_MEM_JIT_DIRECT = 0x10,       /* Safe for JIT-inlined host-pointer access */
-    UAE_MEM_JIT_UNSAFE_BURST = 0x20  /* Keep MOVEM/MOVE16 bursts on per-access helpers */
+    UAE_MEM_JIT_DIRECT = 0x10,       /* With jit_direct_memory: translated code may access the region inline */
+    UAE_MEM_JIT_UNSAFE_BURST = 0x20  /* With jit_direct_memory: conservative mode for maps where a burst
+                                      * (MOVEM, MOVE16) can run off a direct region; see README */
 } uae_mem_flags_t;
 
 /* Registers enumeration */
@@ -106,6 +107,9 @@ typedef struct {
     bool unmapped_bus_error; /* true = access to an unmapped address raises a bus error */
     bool jit_follow_cacr;    /* true = translate only while the guest has the CPU cache enabled
                               * (CACR, WinUAE behaviour); false = always translate */
+    bool jit_direct_memory;  /* true = translated code reads and writes UAE_MEM_JIT_DIRECT regions
+                              * inline through the JIT memory base instead of calling the region
+                              * handlers; see uae_cpu_set_jit_memory_base() */
 } uae_cpu_config_t;
 
 /* Memory Read/Write Callbacks for custom mapped devices */
@@ -280,6 +284,18 @@ void     uae_cpu_invalidate_code(uae_cpu_t *cpu, uint32_t addr, uint32_t size);
  * guest address space, or a RAM buffer mapped at guest address 0). Code
  * anywhere else, and all code while no base is set, runs through the
  * interpreter. Returns 0, or -1 when the library has no JIT.
+ *
+ * With jit_direct_memory, translated code also reads and writes
+ * UAE_MEM_JIT_DIRECT regions whose host pointer equals base + start at
+ * base + address, without calling handlers. Each block is profiled in the
+ * interpreter before it is compiled: accesses that touched only such regions
+ * are inlined, the rest keep the handler call. A later access by the same
+ * instruction to a different address still goes to base + address, so the
+ * window must cover every address translated code can reach (typically one
+ * 4 GB reservation with RAM, ROM and video memory committed in place). If
+ * such an access faults in an uncommitted part of the window, the x86-64
+ * JIT recovers and completes it through the region's handler; on AArch64
+ * the fault reaches the host's SIGSEGV/SIGBUS handler.
  */
 int      uae_cpu_set_jit_memory_base(uae_cpu_t *cpu, uint8_t *base);
 

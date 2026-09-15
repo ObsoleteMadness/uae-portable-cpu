@@ -31,6 +31,27 @@ jobs:
       - name: Run CTest
         run: ctest --test-dir build -C Release --output-on-failure
 
+      # Timings go to the job summary and a CSV artifact for comparing runs.
+      # Shared runners are noisy, so only wrong results fail the step.
+      - name: Benchmark
+        shell: bash
+        run: |
+          bin=build/uae_cpu_bench
+          [ -x "$bin" ] || bin=build/Release/uae_cpu_bench.exe
+          {
+            echo "### Benchmark (${{ matrix.os }})"
+            echo '```'
+            "$bin" --csv bench-${{ matrix.os }}.csv || touch bench-failed
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+          test ! -e bench-failed
+
+      - name: Upload benchmark results
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-${{ matrix.os }}
+          path: bench-${{ matrix.os }}.csv
+
       - name: Test CMake Install
         run: cmake --install build --config Release --prefix install_test
 

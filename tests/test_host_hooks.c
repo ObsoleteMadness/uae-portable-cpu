@@ -16,6 +16,10 @@
 #include <stdint.h>
 #include <stdbool.h>
 
+#ifndef _WIN32
+#include <sys/mman.h>
+#endif
+
 #include "uae_cpu.h"
 
 #define RAM_SIZE 0x100000
@@ -30,8 +34,10 @@ enum {
     OP_NOP = 0x4E71
 };
 
-static uint8_t s_ram[RAM_SIZE];
+static uint8_t s_ram_buf[RAM_SIZE];
+static uint8_t *s_ram = s_ram_buf;  /* guest RAM at 0, also the JIT memory base */
 static bool s_jit_follow_cacr;  /* boot() option for the CACR-gated JIT scenario */
+static bool s_jit_direct;       /* UAE_TEST_JIT_DIRECT: jit_direct_memory in a 4 GB window */
 static uae_cpu_t *s_cpu;
 static int s_failures;
 
@@ -198,12 +204,16 @@ static void boot(uae_cpu_type_t cpu_type, const uint16_t *code, size_t words)
         cfg.jit_enabled = true;
         cfg.jit_cache_size = 8192;
         cfg.jit_follow_cacr = s_jit_follow_cacr;
+        cfg.jit_direct_memory = s_jit_direct;
     }
     uae_cpu_set_config(s_cpu, &cfg);
 
-    memset(s_ram, 0, sizeof(s_ram));
+    memset(s_ram, 0, RAM_SIZE);
     memset(&R, 0, sizeof(R));
-    uae_cpu_map_ram(s_cpu, 0, RAM_SIZE, s_ram);
+    if (s_jit_direct)
+        uae_cpu_map_memory(s_cpu, 0, RAM_SIZE, s_ram, UAE_MEM_RAM | UAE_MEM_CACHEABLE | UAE_MEM_JIT_DIRECT);
+    else
+        uae_cpu_map_ram(s_cpu, 0, RAM_SIZE, s_ram);
     /* RAM starts at guest 0, so the buffer itself is the flat JIT window. */
     uae_cpu_set_jit_memory_base(s_cpu, s_ram);
 
@@ -489,6 +499,116 @@ static void test_translated_memory_loops(void)
         CHECK(uae_cpu_get_jit_code_size(s_cpu) > 0);
 }
 
+/* Device that counts accesses; 16-bit reads return 0x0102. */
+static int s_counter_reads;
+static uint8_t cnt_r8(void *ud, uint32_t a) { (void)ud; (void)a; s_counter_reads++; return 0x01; }
+static uint16_t cnt_r16(void *ud, uint32_t a) { (void)ud; (void)a; s_counter_reads++; return 0x0102; }
+static uint32_t cnt_r32(void *ud, uint32_t a) { (void)ud; (void)a; s_counter_reads++; return 0x01020304; }
+
+static void run_until(uint32_t pc)
+{
+    for (int pass = 0; pass < 50 && reg(UAE_REG_PC) != pc; pass++)
+        uae_cpu_execute(s_cpu, 1000000);
+}
+
+/*
+ * Which memory translated code may touch inline. Runs in every mode; the
+ * cases matter under jit_direct_memory:
+ *   - a region flagged UAE_MEM_JIT_DIRECT whose host pointer is outside the
+ *     JIT window must still be read through its handler;
+ *   - a device read by a loop is called once per access;
+ *   - x86-64 only: a translated read profiled against RAM that later hits the
+ *     device faults in the window and is completed through the handler.
+ */
+static void test_direct_memory(void)
+{
+    /* LEA $200000,A0; MOVE.L #$4000,D3; MOVEQ #0,D2; MOVEQ #0,D1;
+     * loop: MOVE.B (A0)+,D1; ADD.L D1,D2; SUBQ.L #1,D3; BNE loop; exec return */
+    static const uint16_t outside[] = {
+        0x41F9, 0x0020, 0x0000, 0x263C, 0x0000, 0x4000, 0x7400, 0x7200,
+        0x1218, 0xD481, 0x5383, 0x66F8, OP_EXEC_RETURN
+    };
+    /* LEA $400000,A0; MOVE.L #$4000,D3; MOVEQ #0,D2;
+     * loop: MOVE.W (A0),D1; ADD.W D1,D2; SUBQ.L #1,D3; BNE loop; exec return */
+    static const uint16_t device[] = {
+        0x41F9, 0x0040, 0x0000, 0x263C, 0x0000, 0x4000, 0x7400,
+        0x3210, 0xD441, 0x5383, 0x66F8, OP_EXEC_RETURN
+    };
+    /* MOVEQ #0,D2; MOVEQ #1,D7; LEA $80000,A0;
+     * outer: MOVE.L #$4000,D3;
+     * loop: MOVE.W (A0),D1; ADD.W D1,D2; SUBQ.L #1,D3; BNE loop;
+     * LEA $400000,A0; DBF D7,outer; exec return */
+    static const uint16_t ram_then_device[] = {
+        0x7400, 0x7E01, 0x41F9, 0x0008, 0x0000, 0x263C, 0x0000, 0x4000,
+        0x3210, 0xD441, 0x5383, 0x66F8, 0x41F9, 0x0040, 0x0000, 0x51CF, 0xFFEA,
+        OP_EXEC_RETURN
+    };
+    static uint8_t other[0x10000];
+    uint32_t sum = 0;
+
+    printf("[*] JIT-direct region outside the JIT window uses its handler\n");
+    for (uint32_t i = 0; i < sizeof(other); i++)
+        other[i] = (uint8_t)(i * 37 + 11);
+    for (uint32_t i = 0; i < 0x4000; i++)
+        sum += other[i];
+    boot(UAE_CPU_TYPE_68020, outside, sizeof(outside) / sizeof(outside[0]));
+    uae_cpu_map_memory(s_cpu, 0x200000, sizeof(other), other, UAE_MEM_RAM | UAE_MEM_JIT_DIRECT);
+    run_until(0x101A);
+    CHECK(reg(UAE_REG_PC) == 0x101A);
+    CHECK(reg(UAE_REG_D2) == sum);
+    uae_cpu_unmap_memory(s_cpu, 0x200000, sizeof(other));
+
+    printf("[*] device reads from a translated loop reach the handler\n");
+    boot(UAE_CPU_TYPE_68020, device, sizeof(device) / sizeof(device[0]));
+    uae_cpu_map_custom(s_cpu, DEVICE_ADDR, 0x10000, cnt_r8, cnt_r16, cnt_r32,
+                       dev_w8, dev_w16, dev_w32, NULL);
+    s_counter_reads = 0;
+    run_until(0x1018);
+    CHECK(reg(UAE_REG_PC) == 0x1018);
+    CHECK(s_counter_reads == 0x4000);
+    CHECK((reg(UAE_REG_D2) & 0xFFFF) == ((0x4000 * 0x0102) & 0xFFFF));
+    uae_cpu_unmap_memory(s_cpu, DEVICE_ADDR, 0x10000);
+
+#if defined(__x86_64__) || defined(_M_X64)
+    printf("[*] translated RAM read moved onto a device (x86-64 fault recovery)\n");
+    boot(UAE_CPU_TYPE_68020, ram_then_device, sizeof(ram_then_device) / sizeof(ram_then_device[0]));
+    uae_cpu_map_custom(s_cpu, DEVICE_ADDR, 0x10000, cnt_r8, cnt_r16, cnt_r32,
+                       dev_w8, dev_w16, dev_w32, NULL);
+    w16(0x80000, 0x0304);
+    s_counter_reads = 0;
+    run_until(0x1024);
+    CHECK(reg(UAE_REG_PC) == 0x1024);
+    CHECK(s_counter_reads == 0x4000);
+    CHECK((reg(UAE_REG_D2) & 0xFFFF) == ((0x4000 * 0x0304 + 0x4000 * 0x0102) & 0xFFFF));
+    uae_cpu_unmap_memory(s_cpu, DEVICE_ADDR, 0x10000);
+#else
+    (void)ram_then_device;
+#endif
+}
+
+/*
+ * Direct JIT access goes to base + address for whatever address a translated
+ * instruction computes, so the direct-mode run reserves the whole 4 GB guest
+ * space without access and commits only the RAM at guest 0.
+ */
+static uint8_t *reserve_guest_space(void)
+{
+#ifdef _WIN32
+    return NULL;
+#else
+    int flags = MAP_PRIVATE | MAP_ANON;
+#ifdef MAP_NORESERVE
+    flags |= MAP_NORESERVE;
+#endif
+    void *p = mmap(NULL, (size_t)1 << 32, PROT_NONE, flags, -1, 0);
+    if (p == MAP_FAILED)
+        return NULL;
+    if (mprotect(p, RAM_SIZE, PROT_READ | PROT_WRITE) != 0)
+        return NULL;
+    return (uint8_t *)p;
+#endif
+}
+
 static void test_jit_compiles(void)
 {
     /* MOVEQ #0,D0; MOVE.W #999,D1; loop: ADDQ.L #1,D0; DBRA D1,loop; exec return */
@@ -529,6 +649,15 @@ int main(void)
 {
     uae_cpu_global_init();
     s_cpu = uae_cpu_create(NULL);
+    if (getenv("UAE_TEST_JIT") && getenv("UAE_TEST_JIT_DIRECT")) {
+        s_ram = reserve_guest_space();
+        if (!s_ram) {
+            printf("host hooks: cannot reserve the 4 GB guest window\n");
+            return 1;
+        }
+        s_jit_direct = true;
+        printf("[*] running with jit_direct_memory\n");
+    }
 
     test_host_trap_opcodes();
     test_unhandled_illegal();
@@ -543,6 +672,7 @@ int main(void)
     test_reserved_opcodes();
     test_mem_flags();
     test_translated_memory_loops();
+    test_direct_memory();
     test_jit_compiles();
 
     uae_cpu_destroy(s_cpu);

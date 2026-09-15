@@ -34,19 +34,57 @@ uae_u8 *natmem_reserved = NULL;
 size_t natmem_reserved_size = 0;
 
 /*
- * Recomputes the JIT host base for one 64K bank after mem_banks[] changed.
- * Banks without a host mapping get a non-null poison pointer, as in UAE, so
- * a mistaken direct access faults instead of reading address zero.
+ * Recomputes the JIT view of one 64K bank after mem_banks[], the JIT memory
+ * base or the direct-access setting changed.
+ *
+ * baseaddr[] gets the bank's host base; banks without a host mapping get a
+ * non-null poison pointer, as in UAE, so a mistaken direct access faults
+ * instead of reading address zero.
+ *
+ * jit_read_flag / jit_write_flag decide whether profiled accesses to the
+ * bank may compile inline. Only a UAE_MEM_JIT_DIRECT region whose host
+ * pointer really is natmem_offset + start qualifies, and only while direct
+ * access is on (canbang): translated code addresses memory as
+ * natmem_offset + address, so any other host pointer would be read from the
+ * wrong place. ROM writes always go through the handler, which drops them.
  */
 static void jit_sync_baseaddr(int idx)
 {
     addrbank *bank = mem_banks[idx & 0xFFFF];
+    bool direct;
+
     if (bank && bank->baseaddr)
         baseaddr[idx & 0xFFFF] = bank->baseaddr - bank->start;
     else
         baseaddr[idx & 0xFFFF] = (uae_u8 *)bank + 1;
+    if (!bank)
+        return;
+    direct = canbang && natmem_offset && bank->baseaddr &&
+             (bank->host_flags & UAE_MEM_JIT_DIRECT) &&
+             bank->baseaddr == natmem_offset + bank->start;
+    bank->jit_read_flag = direct ? 0 : S_READ;
+    bank->jit_write_flag = (direct && !(bank->flags & ABFLAG_ROM)) ? 0 : S_WRITE;
 }
 #define JIT_SYNC_BASEADDR(idx) jit_sync_baseaddr(idx)
+
+/*
+ * Re-applies jit_sync_baseaddr() to every bank, and enables the JIT's
+ * conservative fallback (jit_n_addr_bank_unsafe) while direct access is on
+ * and some region was mapped with UAE_MEM_JIT_UNSAFE_BURST. Called when the
+ * host changes the memory map, the JIT memory base or the JIT settings.
+ */
+void memory_jit_sync_all(void)
+{
+    bool burst = false;
+
+    for (int i = 0; i < MEMORY_BANKS; i++) {
+        jit_sync_baseaddr(i);
+        if (mem_banks[i] && (mem_banks[i]->flags & ABFLAG_JIT_UNSAFE_BURST))
+            burst = true;
+    }
+    jit_n_addr_bank_unsafe = canbang && burst;
+}
+#define JIT_SYNC_ALL() memory_jit_sync_all()
 
 /*
  * Reads unmapped guest space on behalf of a JIT fault handler.
@@ -75,6 +113,7 @@ uae_u32 dummy_get_safe(uaecptr addr, int size, bool inst, uae_u32 defvalue)
 }
 #else
 #define JIT_SYNC_BASEADDR(idx) ((void)0)
+#define JIT_SYNC_ALL() ((void)0)
 #endif
 addrbank dummy_bank;
 addrbank musashi_bridge_bank;
@@ -492,9 +531,9 @@ int memory_map_ptr(uint32_t start_addr, uint32_t size, uint8_t *host_ptr, uint32
     bank->mask = size - 1;
     bank->flags = ABFLAG_RAM | ((flags & UAE_MEM_ROM) ? ABFLAG_ROM : 0);
     bank->host_flags = flags;
-    /* Only regions the host declared JIT-direct may be accessed inline; ROM writes never are. */
-    bank->jit_read_flag = (flags & UAE_MEM_JIT_DIRECT) ? 0 : S_READ;
-    bank->jit_write_flag = ((flags & UAE_MEM_JIT_DIRECT) && !(flags & UAE_MEM_ROM)) ? 0 : S_WRITE;
+    /* Inline JIT access is decided per bank by JIT_SYNC_BASEADDR(). */
+    bank->jit_read_flag = S_READ;
+    bank->jit_write_flag = S_WRITE;
     if (flags & UAE_MEM_JIT_UNSAFE_BURST)
         bank->flags |= ABFLAG_JIT_UNSAFE_BURST;
 
@@ -505,6 +544,7 @@ int memory_map_ptr(uint32_t start_addr, uint32_t size, uint8_t *host_ptr, uint32
         ce_cachable[idx] = (flags & UAE_MEM_CACHEABLE) ? 1 : 0;
         ce_banktype[idx] = CE_MEMBANK_FAST32;
     }
+    JIT_SYNC_ALL();
     return 0;
 }
 
@@ -546,6 +586,7 @@ int memory_map_custom(uint32_t start_addr, uint32_t size,
         mem_banks[idx] = bank;
         JIT_SYNC_BASEADDR(idx);
     }
+    JIT_SYNC_ALL();
     return 0;
 }
 
@@ -578,6 +619,7 @@ void memory_unmap(uint32_t start_addr, uint32_t size) {
             free(bank_to_free);
         }
     }
+    JIT_SYNC_ALL();
 }
 
 /*
