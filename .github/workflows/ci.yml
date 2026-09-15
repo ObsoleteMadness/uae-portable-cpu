@@ -33,3 +33,29 @@ jobs:
 
       - name: Test CMake Install
         run: cmake --install build --config Release --prefix install_test
+
+  isolated-symbols:
+    name: Isolated symbols, no Musashi API (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ ubuntu-latest, macos-latest ]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure CMake
+        run: >
+          cmake -B build
+          -DCMAKE_BUILD_TYPE=Release
+          -DENABLE_TESTS=ON
+          -DUAE_CPU_MUSASHI_API=OFF
+          -DUAE_CPU_ISOLATE_SYMBOLS=ON
+
+      - name: Build
+        run: cmake --build build --config Release -j
+
+      - name: Run CTest
+        run: ctest --test-dir build -C Release --output-on-failure

@@ -53,7 +53,9 @@ typedef enum {
     UAE_MEM_RAM       = 0x01,
     UAE_MEM_ROM       = 0x02,
     UAE_MEM_IO        = 0x04,
-    UAE_MEM_CACHEABLE = 0x08
+    UAE_MEM_CACHEABLE = 0x08,
+    UAE_MEM_JIT_DIRECT = 0x10,       /* Safe for JIT-inlined host-pointer access */
+    UAE_MEM_JIT_UNSAFE_BURST = 0x20  /* Keep MOVEM/MOVE16 bursts on per-access helpers */
 } uae_mem_flags_t;
 
 /* Registers enumeration */
@@ -101,6 +103,7 @@ typedef struct {
     int timing_mode;         /* 0 = fast/standard, 1 = prefetch, 2 = cycle-exact */
     bool jit_enabled;        /* true = enable dynamic translation if available */
     uint32_t jit_cache_size; /* JIT code cache size in KB (e.g. 8192) */
+    bool unmapped_bus_error; /* true = access to an unmapped address raises a bus error */
 } uae_cpu_config_t;
 
 /* Memory Read/Write Callbacks for custom mapped devices */
@@ -116,6 +119,66 @@ typedef void (*uae_reset_hook_fn)(void *userdata);
 typedef void (*uae_instr_hook_fn)(void *userdata, uint32_t pc);
 typedef int  (*uae_int_ack_fn)(void *userdata, int int_level);
 typedef int  (*uae_trap_hook_fn)(void *userdata, int trap_nr);
+
+/*
+ * Host hooks (full contracts in HOST_HOOKS.md).
+ *
+ * Hooks run on the CPU thread inside uae_cpu_execute() / uae_cpu_step(), with
+ * the status register already materialised. A hook may read and write
+ * registers and memory, call uae_cpu_end_timeslice(), and run guest code
+ * re-entrantly with uae_cpu_execute(). A NULL hook keeps the core's
+ * Motorola-accurate behaviour.
+ *
+ * Resume rule for illegal / aline / fline: return non-zero to mark the
+ * instruction handled. If the hook left the PC at `pc`, execution continues
+ * at pc + 2; if it moved the PC, execution continues there.
+ */
+
+/* Why a Line-F instruction reached the host. */
+typedef enum {
+    UAE_FLINE_UNKNOWN    = 0, /* Unrecognised or unimplemented Line-F word */
+    UAE_FLINE_FPU_ABSENT = 1, /* FPU instruction with no FPU configured (or FPU disabled) */
+    UAE_FLINE_MMU_ABSENT = 2  /* MMU instruction with no MMU configured */
+} uae_fline_reason_t;
+
+/* Exception details passed to the observer before the stack frame is built. */
+typedef struct {
+    int      vector;      /* 680x0 vector number */
+    uint32_t fault_pc;    /* Faulting instruction address (current PC for interrupts) */
+    uint32_t current_pc;  /* PC at dispatch; may already be past the instruction */
+    uint16_t opcode;      /* Instruction word being executed */
+    uint16_t sr;          /* Status register before the exception */
+    bool     interrupt;   /* True for vectors 24..31 */
+} uae_cpu_exception_info_t;
+
+typedef struct {
+    void *userdata;
+
+    /* Illegal instruction (not Line-A / Line-F), before vector 4. */
+    int (*illegal)(void *userdata, uint16_t opcode, uint32_t pc);
+
+    /* Line-A word, before vector 10. */
+    int (*aline)(void *userdata, uint16_t opcode, uint32_t pc);
+
+    /* Line-F word the CPU cannot execute, before vector 11 or the 68040/060
+     * unimplemented-FPU exception. For multi-word instructions the hook must
+     * move the PC past the whole instruction. */
+    int (*fline)(void *userdata, uint16_t opcode, uint32_t pc, uae_fline_reason_t reason);
+
+    /* Observes every exception, interrupts included; cannot cancel it. */
+    void (*exception)(void *userdata, const uae_cpu_exception_info_t *info);
+
+    /* Pulled interrupt level 0..7. Sampled at the start of every execute call
+     * and whenever the core re-checks interrupts (see uae_cpu_signal_irq). */
+    int (*get_irq)(void *userdata);
+
+    /* DBF Dn,*-2 delay loop (fast interpreter only, never cycle-exact). Called
+     * each time the DBF executes with the current Dn.W count. Return 0 to run
+     * that one iteration normally (the hook is offered the next one too);
+     * otherwise the loop completes at once (Dn.W = 0xFFFF, PC falls through)
+     * and the returned number of CPU cycles is credited. */
+    uint32_t (*dbf_spin)(void *userdata, int dreg, uint16_t count);
+} uae_cpu_host_hooks_t;
 
 /* Opaque CPU Instance Handle */
 typedef struct uae_cpu_instance uae_cpu_t;
@@ -140,7 +203,7 @@ bool       uae_cpu_is_stopped(uae_cpu_t *cpu);
 bool       uae_cpu_is_halted(uae_cpu_t *cpu);
 
 /* Interrupts & Control */
-void       uae_cpu_set_irq(uae_cpu_t *cpu, int level);
+void       uae_cpu_set_irq(uae_cpu_t *cpu, int level);   /* Thread-safe */
 int        uae_cpu_get_irq(uae_cpu_t *cpu);
 void       uae_cpu_pulse_halt(uae_cpu_t *cpu);
 void       uae_cpu_pulse_bus_error(uae_cpu_t *cpu);
@@ -181,7 +244,33 @@ void     uae_cpu_write_long(uae_cpu_t *cpu, uint32_t addr, uint32_t val);
 void uae_cpu_set_reset_hook(uae_cpu_t *cpu, uae_reset_hook_fn fn, void *userdata);
 void uae_cpu_set_instr_hook(uae_cpu_t *cpu, uae_instr_hook_fn fn, void *userdata);
 void uae_cpu_set_int_ack_hook(uae_cpu_t *cpu, uae_int_ack_fn fn, void *userdata);
+/* TRAP #0-15: fn(userdata, trap_nr) returns non-zero to service the TRAP in the
+ * host (no exception is taken; execution continues after the TRAP). */
 void uae_cpu_set_trap_hook(uae_cpu_t *cpu, uae_trap_hook_fn fn, void *userdata);
+
+/* Host hooks */
+void     uae_cpu_set_host_hooks(uae_cpu_t *cpu, const uae_cpu_host_hooks_t *hooks); /* NULL clears */
+/* Route [first, last] to the illegal/aline/fline hooks even if the CPU model
+ * decodes them. Returns 0, or -1 if the range is inverted or 16 are in use. */
+int      uae_cpu_reserve_opcodes(uae_cpu_t *cpu, uint16_t first, uint16_t last);
+void     uae_cpu_clear_reserved_opcodes(uae_cpu_t *cpu);
+
+/* Execution control, callable from inside hooks */
+void     uae_cpu_end_timeslice(uae_cpu_t *cpu); /* Innermost execute returns after this instruction */
+int      uae_cpu_execute_depth(uae_cpu_t *cpu); /* Active execute/step calls; 0 when not running */
+void     uae_cpu_signal_irq(uae_cpu_t *cpu);    /* Thread-safe: re-sample the interrupt level */
+uint64_t uae_cpu_get_cycles(uae_cpu_t *cpu);    /* Monotonic CPU cycles since the core was initialised */
+
+/* Abort the current instruction with a bus error. Call from memory callbacks
+ * or hooks during execution; it has no effect outside uae_cpu_execute/step. */
+void     uae_cpu_raise_bus_error(uae_cpu_t *cpu, uint32_t addr, bool is_write, int size);
+
+/* Discard translated code overlapping [addr, addr + size); size ~0 flushes
+ * everything. No-op while the library is built without a JIT. */
+void     uae_cpu_invalidate_code(uae_cpu_t *cpu, uint32_t addr, uint32_t size);
+
+/* uae_mem_flags_t bits of the region containing addr; 0 when unmapped. */
+uint32_t uae_cpu_get_mem_flags(uae_cpu_t *cpu, uint32_t addr);
 
 /* Disassembler */
 int  uae_cpu_disassemble(uae_cpu_t *cpu, uint32_t pc, char *output_str, size_t maxlen);

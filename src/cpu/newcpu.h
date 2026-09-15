@@ -848,6 +848,8 @@ extern int m68k_movec2 (int, uae_u32 *);
 extern int m68k_divl (uae_u32, uae_u32, uae_u16, uaecptr);
 extern int m68k_mull (uae_u32, uae_u32, uae_u16);
 extern void init_m68k (void);
+/* Host DBF delay-loop hook, called from generated fast-table DBF handlers. */
+extern int uae_host_dbf_spin(int dreg);
 extern void m68k_run(void);
 extern void m68k_go (int);
 extern void m68k_dumpstate(uaecptr *, uaecptr);

@@ -26,6 +26,7 @@
 #include "events.h"
 #include "memory.h"
 #include "newcpu.h"
+#include "host_hooks.h"
 #include "disasm.h"
 #include "cpummu.h"
 #include "cpummu030.h"
@@ -1969,6 +1970,20 @@ const struct cputbl *getjitcputbl(int cpulvl, int direct)
 
 #endif
 
+/*
+ * Routes every host-reserved opcode (uae_cpu_reserve_opcodes) to op_illg so
+ * the host hooks see it even when the CPU model decodes it as an instruction.
+ */
+void uae_host_apply_reserved_opcodes(void)
+{
+	for (uae_u32 opcode = 0; opcode < 65536; opcode++) {
+		if (uae_host_opcode_reserved(opcode)) {
+			cpufunctbl[opcode] = op_illg_1;
+			cpufunctbl_noret[opcode] = op_illg_1_noret;
+		}
+	}
+}
+
 static void build_cpufunctbl (void)
 {
 	int i, opcnt;
@@ -2099,6 +2114,7 @@ static void build_cpufunctbl (void)
 
 	}
 
+	uae_host_apply_reserved_opcodes();
 	need_opcode_swap = 0;
 #ifdef HAVE_GET_WORD_UNSWAPPED
 	if (jit) {
@@ -2675,8 +2691,8 @@ static void exception_check_trace (int nr)
 
 static void exception_debug (int nr)
 {
-	if (g_trap_hook)
-		g_trap_hook(g_trap_userdata, nr);
+	/* Host observation happens once per exception in ExceptionX(). */
+	(void)nr;
 }
 
 #ifdef CPUEMU_13
@@ -3609,6 +3625,15 @@ kludge_me_do:
 static void ExceptionX (int nr, uaecptr address, uaecptr oldpc)
 {
 	uaecptr pc = m68k_getpc();
+
+	/* TRAP #0-15: the host may service the call itself; no frame is built. */
+	if (nr >= 32 && nr < 48 && g_trap_hook && g_trap_hook(g_trap_userdata, nr - 32)) {
+		fill_prefetch ();
+		return;
+	}
+	/* Interrupts have no faulting instruction; report where they arrived. */
+	uae_host_note_exception(nr,
+		(nr >= 24 && nr < 32) ? pc : (oldpc != 0xffffffff ? oldpc : regs.instruction_pc), pc);
 	regs.exception = nr;
 	regs.loop_mode = 0;
 
@@ -3725,6 +3750,12 @@ static void bus_error(void)
 	} CATCH (prb2) {
 		cpu_halt (CPU_HALT_BUS_ERROR_DOUBLE_FAULT);
 	} ENDTRY
+}
+
+/* Raises the bus error recorded by hardware_exception2() after a caught THROW. */
+void uae_host_bus_error_caught(void)
+{
+	bus_error();
 }
 
 static int get_ipl(void)
@@ -4042,6 +4073,12 @@ uae_u32 REGPARAM2 op_illg (uae_u32 opcode)
 {
 	uaecptr pc = m68k_getpc ();
 	static int warned;
+
+	/* Host hooks see the opcode before any core illegal-instruction policy. */
+	if (uae_host_dispatch_trap_opcode(opcode)) {
+		fill_prefetch ();
+		return 4;
+	}
 
 #ifndef WINUAE_FOR_HATARI
 	int inrom = in_rom (pc);
@@ -4482,7 +4519,11 @@ void mmu_op (uae_u32 opcode, uae_u32 extra)
 #if MMUOP_DEBUG > 0
 	write_log (_T("Unknown MMU OP %04X\n"), opcode);
 #endif
+	/* No MMU configured: the host may treat MMU instructions as no-ops. */
+	if (uae_host_call_fline(opcode, m68k_getpc () - 2, UAE_FLINE_MMU_ABSENT))
+		return;
 	m68k_setpc_normal (m68k_getpc () - 2);
+	g_host_fline_consulted = 1;
 	op_illg (opcode);
 }
 

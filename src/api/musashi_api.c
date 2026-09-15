@@ -11,6 +11,7 @@
 #include "fpp.h"
 #include "disasm.h"
 #include "m68k.h"
+#include "host_hooks.h"
 
 static int s_cpu_type = M68K_CPU_TYPE_68000;
 static int (*s_int_ack_cb)(int) = NULL;
@@ -51,6 +52,13 @@ static int musashi_trap_bridge(void *userdata, int trap_nr) {
         return s_trap_cb(trap_nr);
     }
     return 0;
+}
+
+/* Musashi's illegal-instruction callback only sees true illegal opcodes. */
+static int musashi_illg_bridge(void *userdata, uint16_t opcode, uint32_t pc) {
+    (void)userdata;
+    (void)pc;
+    return s_illg_cb ? s_illg_cb(opcode) : 0;
 }
 
 void m68k_init(void) {
@@ -146,30 +154,7 @@ void m68k_pulse_reset(void) {
 }
 
 int m68k_execute(int num_cycles) {
-    evt_t start = currcycle;
-    evt_t target = start + (evt_t)num_cycles * CYCLE_UNIT;
-
-    while (currcycle < target && !regs.stopped && !regs.halted) {
-        if (regs.spcflags) {
-            if (do_specialties(0))
-                break;
-        }
-
-        if (s_instr_hook_cb) {
-            s_instr_hook_cb(m68k_getpc());
-        }
-
-        uae_u16 opcode = x_get_iword(0);
-        int cycles = (*cpufunctbl[opcode])(opcode) & 0xFFFF;
-        if (cycles == 0) {
-            cycles = (CurrentInstrCycles > 0 ? CurrentInstrCycles : 4) * (CYCLE_UNIT / 2);
-        }
-        cycles = adjust_cycles(cycles);
-        do_cycles(cycles);
-        regs.instruction_cnt++;
-    }
-
-    return (int)((currcycle - start) / CYCLE_UNIT);
+    return uae_host_run(num_cycles);
 }
 
 int m68k_cycles_run(void) {
@@ -352,6 +337,7 @@ void m68k_set_tas_instr_callback(int (*callback)(void)) {
 }
 void m68k_set_illg_instr_callback(int (*callback)(int)) {
     s_illg_cb = callback;
+    g_host_hooks.illegal = callback ? musashi_illg_bridge : NULL;
 }
 void m68k_set_trap_instr_callback(int (*callback)(int)) {
     s_trap_cb = callback;
