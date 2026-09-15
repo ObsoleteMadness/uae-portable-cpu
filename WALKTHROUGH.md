@@ -41,7 +41,7 @@ All 6 test targets are integrated into CMake and pass via `ctest`:
 | Test Target | Suite Description | Tests Passed | Pass Rate | Status |
 | :--- | :--- | :--- | :--- | :--- |
 | **`test_basic`** | Musashi & UAE context API smoke tests | All assertions | 100% | **PASSED** |
-| **`test_uae_cpu`** | Native UAE Core: 68000–68060 switching, CCR, bitfields, CAS, SoftFloat FPU (`FMUL.D`), context isolation | All assertions | 100% | **PASSED** |
+| **`test_uae_cpu`** | Native UAE Core: 68000–68060 switching, CCR, bitfields, CAS, SoftFloat FPU (`FMUL.D`), shared handles | All assertions | 100% | **PASSED** |
 | **`musashi_68000`** | Musashi 68000 instruction verification test suite | 55 / 60 | 91.7% | **PASSED** |
 | **`musashi_68040`** | Musashi 68040 instruction verification test suite | 16 / 18 | 88.9% | **PASSED** |
 | **`m68k_rs_coverage`** | `m68k-rs` comprehensive opcode coverage test suite | 25 / 25 | 100.0% | **PASSED** |
