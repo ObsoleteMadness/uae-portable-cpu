@@ -98,7 +98,7 @@ else()
 endif()
 string(TOLOWER "${UAE_CPU_JIT_PROCESSOR}" UAE_CPU_JIT_PROCESSOR)
 set(UAE_CPU_JIT_SUPPORTED OFF)
-if(NOT MSVC AND UAE_CPU_JIT_PROCESSOR MATCHES "^(arm64|aarch64|x86_64|amd64)$")
+if(UAE_CPU_JIT_PROCESSOR MATCHES "^(arm64|aarch64|x86_64|amd64)$")
     set(UAE_CPU_JIT_SUPPORTED ON)
 endif()
 if(UAE_CPU_JIT STREQUAL "ON" AND NOT UAE_CPU_JIT_SUPPORTED)
@@ -142,9 +142,16 @@ target_compile_definitions(uaecpu PRIVATE UAE_CPU_MUSASHI_API=$<BOOL:${UAE_CPU_M
 if(UAE_CPU_JIT_ENABLED)
     target_compile_definitions(uaecpu PRIVATE JIT USE_JIT_FPU NATMEM_OFFSET=natmem_offset)
     target_include_directories(uaecpu PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/cpu/jit)
+    # Upstream JIT sources: warnings off. MSVC needs /bigobj for the generated
+    # opcode compilers (compemu_x86.cpp alone is over 100,000 lines).
+    if(MSVC)
+        set(UAE_CPU_JIT_SOURCE_FLAGS "/w /bigobj")
+    else()
+        set(UAE_CPU_JIT_SOURCE_FLAGS "-w -fwrapv")
+    endif()
     set_source_files_properties(src/cpu/jit/compemu.cpp src/cpu/jit/compemu_support.cpp
         src/cpu/jit/compstbl.cpp src/cpu/jit/compemu_fpp.cpp
-        PROPERTIES COMPILE_FLAGS "-w -fwrapv")
+        PROPERTIES COMPILE_FLAGS "${UAE_CPU_JIT_SOURCE_FLAGS}")
 endif()
 # Real definitions instead of C "common" symbols: the linker cannot hide a
 # common symbol, which would leak internals such as regs out of uaecpu_isolated.

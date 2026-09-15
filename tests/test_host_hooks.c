@@ -16,7 +16,11 @@
 #include <stdint.h>
 #include <stdbool.h>
 
-#ifndef _WIN32
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+#else
 #include <sys/mman.h>
 #endif
 
@@ -597,7 +601,14 @@ static void test_direct_memory(void)
  */
 static uint8_t *reserve_guest_space(void)
 {
-#ifdef _WIN32
+#if defined(_WIN64)
+    void *p = VirtualAlloc(NULL, (SIZE_T)1 << 32, MEM_RESERVE, PAGE_NOACCESS);
+    if (!p)
+        return NULL;
+    if (!VirtualAlloc(p, RAM_SIZE, MEM_COMMIT, PAGE_READWRITE))
+        return NULL;
+    return (uint8_t *)p;
+#elif defined(_WIN32)
     return NULL;
 #else
     int flags = MAP_PRIVATE | MAP_ANON;

@@ -12,7 +12,11 @@
 #include "portable_dirent.h"
 #include <sys/types.h>
 #include <sys/stat.h>
-#ifndef _WIN32
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+#else
 #include <sys/mman.h>
 #endif
 
@@ -348,7 +352,15 @@ static uint8_t *g_jit_flat;
 static bool alloc_jit_flat(void) {
     if (g_jit_flat)
         return true;
-#if !defined(_WIN32) && UINTPTR_MAX > 0xFFFFFFFFu
+#if defined(_WIN64)
+    if (getenv("UAE_TEST_JIT_DIRECT")) {
+        void *p = VirtualAlloc(NULL, (SIZE_T)1 << 32, MEM_RESERVE, PAGE_NOACCESS);
+        if (!p || !VirtualAlloc(p, JIT_FLAT_SIZE, MEM_COMMIT, PAGE_READWRITE))
+            return false;
+        g_jit_flat = (uint8_t *)p;
+        return true;
+    }
+#elif !defined(_WIN32) && UINTPTR_MAX > 0xFFFFFFFFu
     if (getenv("UAE_TEST_JIT_DIRECT")) {
         int flags = MAP_PRIVATE | MAP_ANON;
 #ifdef MAP_NORESERVE

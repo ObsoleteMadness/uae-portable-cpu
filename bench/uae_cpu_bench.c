@@ -303,7 +303,14 @@ static void dev_w32(void *ud, uint32_t a, uint32_t v) { (void)ud; (void)a; (void
  */
 static uint8_t *alloc_guest_ram(void)
 {
-#if !defined(_WIN32) && UINTPTR_MAX > 0xFFFFFFFFu
+#if defined(_WIN64)
+    void *p = VirtualAlloc(NULL, (SIZE_T)1 << 32, MEM_RESERVE, PAGE_NOACCESS);
+    if (p) {
+        if (VirtualAlloc(p, RAM_SIZE, MEM_COMMIT, PAGE_READWRITE))
+            return (uint8_t *)p;
+        VirtualFree(p, 0, MEM_RELEASE);
+    }
+#elif !defined(_WIN32) && UINTPTR_MAX > 0xFFFFFFFFu
     size_t span = (size_t)1 << 32;
     int flags = MAP_PRIVATE | MAP_ANON;
 #ifdef MAP_NORESERVE
