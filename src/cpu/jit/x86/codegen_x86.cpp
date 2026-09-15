@@ -1595,7 +1595,7 @@ static inline void raw_reg_to_flags_FLAGREG(int r)
 }
 
 #define FLAG_NREG3_FLAGREG EAX_INDEX  /* Set to -1 if any register will do */
-static __inline__ void raw_flags_set_zero_FLAGREG(int s, int tmp)
+static inline void raw_flags_set_zero_FLAGREG(int s, int tmp)
 {
 	raw_mov_l_rr(tmp,s);
 	raw_lahf(s); /* flags into ah */
