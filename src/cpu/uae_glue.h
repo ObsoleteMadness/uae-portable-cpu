@@ -121,6 +121,12 @@ void    wait_cpu_cycle_write_ce020(uaecptr addr, int mode, uae_u32 v);
 
 /* Logging */
 void write_log(const TCHAR *format, ...);
+/* Converts a TCHAR string to a newly allocated char string; free with xfree(). */
+char *ua(const TCHAR *s);
+/* Converts a char string to a newly allocated TCHAR string; free with xfree(). */
+TCHAR *au(const char *s);
+/* Reports an unrecoverable JIT compiler error and aborts. */
+void jit_abort(const TCHAR *format, ...);
 void error_log(const TCHAR *format, ...);
 TCHAR* buf_out(TCHAR *buffer, int *bufsize, const TCHAR *format, ...);
 

@@ -199,7 +199,9 @@ cycle-exact, MMU and test cores always execute the loop literally.
 | `uae_cpu_signal_irq(cpu)` | Re-sample the interrupt level (thread-safe) |
 | `uae_cpu_get_cycles(cpu)` | Monotonic 64-bit CPU cycle count since the core was initialised; usable as an emulated clock |
 | `uae_cpu_raise_bus_error(cpu, addr, is_write, size)` | Abort the current instruction with a bus error. The frame matches the configured CPU. No effect outside execute calls |
-| `uae_cpu_invalidate_code(cpu, addr, size)` | Discard translated code overlapping the range (`size = ~0` for everything). A no-op while the JIT backends are not part of the build, so hosts can call it unconditionally |
+| `uae_cpu_invalidate_code(cpu, addr, size)` | Discard translated code that may overlap the range. Blocks are checksummed before reuse, so any size > 0 is safe. A no-op without a JIT, so hosts can call it unconditionally |
+| `uae_cpu_set_jit_memory_base(cpu, base)` | Declare the flat guest window (`host = base + guest`) the JIT translates code from |
+| `uae_cpu_get_jit_code_size(cpu)` | Bytes of translated host code in the cache (0 without a JIT) |
 | `uae_cpu_get_mem_flags(cpu, addr)` | `uae_mem_flags_t` bits of the region containing `addr`; 0 when unmapped |
 
 ### Memory region flags
@@ -209,8 +211,8 @@ cycle-exact, MMU and test cores always execute the loop literally.
 
 | Flag | Meaning |
 |------|---------|
-| `UAE_MEM_JIT_DIRECT` | A JIT may inline host-pointer reads (and writes, unless the region is ROM) |
-| `UAE_MEM_JIT_UNSAFE_BURST` | A JIT must keep MOVEM/MOVE16 bursts into this region on per-access helpers |
+| `UAE_MEM_JIT_DIRECT` | With `jit_direct_memory`: translated code may read and write the region inline, provided its host pointer is `base + start` for the JIT memory base. Otherwise the flag has no effect |
+| `UAE_MEM_JIT_UNSAFE_BURST` | With `jit_direct_memory`: conservative mode for memory maps where a burst (MOVEM, MOVE16) can run off a direct region. Blocks touching handler-backed memory are interpreted, and on x86-64 translated accesses use the handlers |
 
 Custom regions (`uae_cpu_map_custom`) always report `UAE_MEM_IO` and are
 never JIT-direct.
@@ -245,6 +247,23 @@ symbol breaks the build.
 
 ---
 
+## Under the JIT
+
+With `jit_enabled` (see the [README](README.md#3-jit-compiler)), every hook keeps its contract:
+
+| Hook / call | What the JIT does |
+|-------------|-------------------|
+| `illegal`, `aline`, `fline`, TRAP | The opcode runs through its C handler inside translated code and ends the block, so a hook that moves the PC or runs guest code takes effect at once |
+| `uae_cpu_reserve_opcodes()` | Reserved words are never compiled natively and always end a block; reserving rebuilds the translation tables |
+| Nested `uae_cpu_execute()` | Runs on the interpreter: a C handler called from translated code never re-enters compiled code |
+| `uae_cpu_end_timeslice()` | Translated code returns to the dispatcher at the next instruction boundary it checks, and the execute call returns |
+| `dbf_spin` | While the hook is installed, `DBF Dn` is routed to its C handler so the hook is offered; installing or removing it rebuilds the tables |
+| `exception` | Fires as in the interpreter; `fault_pc` comes from the instruction being dispatched |
+| `get_irq`, `uae_cpu_signal_irq()` | Interrupts are taken at block boundaries |
+| `uae_cpu_raise_bus_error()` | Aborts the instruction from inside translated code through the JIT's bus-error recovery. Exception: with `jit_direct_memory` on x86-64 and Windows ARM64, a handler reached through fault recovery (an inlined access that hit an inaccessible part of the window) cannot raise one, and the call is ignored |
+| Memory callbacks | Called for every access by default. With `jit_direct_memory`, accesses that profiling saw in `UAE_MEM_JIT_DIRECT` RAM are inlined and never reach a callback |
+| `instruction` hook | Only called for code that runs on the interpreter |
+
 ## Musashi-compatible API
 
 - `m68k_set_illg_instr_callback()` is wired to the `illegal` hook. The
@@ -262,8 +281,14 @@ symbol breaks the build.
 ## Limitations
 
 - Hook state is global, like the rest of the core: one CPU per process.
-- The JIT backends under `src/cpu/jit/` are not part of the build.
-  `uae_cpu_invalidate_code()` is a no-op, and the JIT memory flags are recorded
-  for when a JIT is integrated.
+- The JIT translates only from the flat window set with
+  `uae_cpu_set_jit_memory_base()`. Direct memory access (`jit_direct_memory`)
+  needs that window to cover the guest address space, and recovers faults in
+  it only on x86-64 and Windows ARM64.
+- With `jit_direct_memory` on x86-64 the library installs a SIGSEGV (and, on
+  macOS, SIGBUS) handler the first time it builds its tables. Faults outside
+  translated code are passed to the handler that was installed before it.
+  On Windows (x64 and ARM64) it adds a vectored exception handler instead,
+  which passes on every exception it does not handle.
 - `uae_cpu_raise_bus_error()` only takes effect inside `uae_cpu_execute()`,
   `uae_cpu_step()` or `m68k_execute()`.

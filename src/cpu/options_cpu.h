@@ -557,6 +557,10 @@ struct uae_prefs {
 	bool comp_constjump;
 	bool comp_catchfault;
 	int cachesize;
+	/* JIT-read fields; their WinUAE originals are inside !WINUAE_FOR_HATARI blocks. */
+	int uaeboard;         /* UAE expansion board level (always 0 here; read by the JIT) */
+	bool illegal_mem;     /* Log illegal memory access (read by JIT prefs) */
+	int cs_unmapped_space;  /* Unmapped-access policy (0 here; read by the x86 JIT fault handler) */
 	bool cachesize_inhibit;
 	TCHAR jitblacklist[MAX_DPATH];
 	bool fpu_strict;

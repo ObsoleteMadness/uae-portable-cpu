@@ -7,7 +7,7 @@
  * 3. 68020+ Bitfields: BFTST, BFEXTU, BFFFO
  * 4. 68020+ Atomic operations: CAS
  * 5. FPU Floating-Point & Transcendentals via Softfloat: FMUL.D, FMOVE
- * 6. Multi-instance Context Isolation: Concurrent independent CPU states
+ * 6. Handles: every uae_cpu_t refers to the same (single-instance) CPU
  */
 
 #include <stdio.h>
@@ -15,12 +15,39 @@
 #include <string.h>
 #include <stdint.h>
 #include <stdbool.h>
+/* The checks are assert()s: keep them in Release builds, where CMake defines NDEBUG. */
+#undef NDEBUG
 #include <assert.h>
 
 #include "uae_cpu.h"
 
 #define RAM_SIZE 0x100000 /* 1MB test RAM */
+
+/* UAE_TEST_JIT=1 re-runs the suite with the JIT enabled for 68020+ models. */
+static void apply_test_jit(uae_cpu_config_t *cfg) {
+    if (getenv("UAE_TEST_JIT")) {
+        cfg->jit_enabled = true;
+        cfg->jit_cache_size = 8192;
+    }
+}
 static uint8_t s_ram[RAM_SIZE];
+
+#define CODE_ADDR 0x1000
+#define STOP_ADDR 0x800        /* every exception vector: exec return */
+#define OP_EXEC_RETURN 0x7100  /* MOVEQ with bit 8 set: ends a test program */
+
+static bool s_done;
+static uint32_t s_stop_pc;
+static uint32_t s_end_pc;      /* address of the program's exec return */
+
+static int on_illegal(void *ud, uint16_t opcode, uint32_t pc) {
+    if (opcode != OP_EXEC_RETURN)
+        return 0;
+    s_done = true;
+    s_stop_pc = pc;
+    uae_cpu_end_timeslice((uae_cpu_t *)ud);
+    return 1;
+}
 
 static void write_mem16(uint32_t addr, uint16_t val) {
     if (addr + 1 < RAM_SIZE) {
@@ -46,15 +73,40 @@ static uint32_t read_mem32(uint32_t addr) {
     return 0;
 }
 
+/*
+ * Loads a program that ends with OP_EXEC_RETURN at CODE_ADDR. Every exception
+ * vector points at another exec return, so a stray exception also ends the
+ * run, at a different PC than the program's own end.
+ */
 static void setup_test_program(uae_cpu_t *cpu, const uint16_t *opcodes, size_t count) {
+    uae_cpu_host_hooks_t hooks;
+
     memset(s_ram, 0, sizeof(s_ram));
     uae_cpu_map_ram(cpu, 0x00000, RAM_SIZE, s_ram);
+    uae_cpu_set_jit_memory_base(cpu, s_ram);  /* flat JIT window (RAM at guest 0) */
     write_mem32(0x00, 0x80000); /* Initial SSP */
-    write_mem32(0x04, 0x1000);  /* Initial PC */
+    write_mem32(0x04, CODE_ADDR);  /* Initial PC */
+    for (uint32_t v = 2; v < 256; v++)
+        write_mem32(v * 4, STOP_ADDR);
+    write_mem16(STOP_ADDR, OP_EXEC_RETURN);
     for (size_t i = 0; i < count; i++) {
-        write_mem16(0x1000 + i * 2, opcodes[i]);
+        write_mem16(CODE_ADDR + i * 2, opcodes[i]);
     }
+    s_end_pc = CODE_ADDR + (uint32_t)(count - 1) * 2;
+    memset(&hooks, 0, sizeof(hooks));
+    hooks.userdata = cpu;
+    hooks.illegal = on_illegal;
+    uae_cpu_set_host_hooks(cpu, &hooks);
     uae_cpu_reset(cpu);
+}
+
+/* Runs the loaded program to its exec return; fails on any exception. */
+static void run_program(uae_cpu_t *cpu) {
+    s_done = false;
+    for (int pass = 0; pass < 100 && !s_done; pass++)
+        uae_cpu_execute(cpu, 100000);
+    assert(s_done);
+    assert(s_stop_pc == s_end_pc);
 }
 
 /* --- Tests --- */
@@ -75,6 +127,7 @@ static void test_cpu_models(void) {
 
     for (int i = 0; i < 6; i++) {
         cfg.cpu_type = models[i];
+        apply_test_jit(&cfg);
         uae_cpu_t *cpu = uae_cpu_create(&cfg);
         assert(cpu != NULL);
         uae_cpu_config_t out_cfg;
@@ -90,16 +143,17 @@ static void test_alu_ccr(void) {
     uae_cpu_config_t cfg;
     memset(&cfg, 0, sizeof(cfg));
     cfg.cpu_type = UAE_CPU_TYPE_68000;
+    apply_test_jit(&cfg);
     uae_cpu_t *cpu = uae_cpu_create(&cfg);
 
     /* Test ADD.L: 0x7FFFFFFF + 1 -> 0x80000000 (V=1, N=1, Z=0, C=0) */
     uint16_t prog_add[] = {
         0x203C, 0x7FFF, 0xFFFF, /* MOVE.L #0x7FFFFFFF, D0 */
         0x5280,                 /* ADDQ.L #1, D0 */
-        0x4E71                  /* NOP */
+        OP_EXEC_RETURN                  /* end */
     };
     setup_test_program(cpu, prog_add, sizeof(prog_add)/2);
-    uae_cpu_execute(cpu, 50);
+    run_program(cpu);
 
     uint32_t d0 = uae_cpu_get_reg(cpu, UAE_REG_D0);
     uint16_t sr = uae_cpu_get_reg(cpu, UAE_REG_SR);
@@ -110,10 +164,10 @@ static void test_alu_ccr(void) {
     uint16_t prog_sub[] = {
         0x203C, 0x0000, 0x0100, /* MOVE.L #0x100, D0 */
         0x90BC, 0x0000, 0x0100, /* SUB.L #0x100, D0 */
-        0x4E71                  /* NOP */
+        OP_EXEC_RETURN                  /* end */
     };
     setup_test_program(cpu, prog_sub, sizeof(prog_sub)/2);
-    uae_cpu_execute(cpu, 50);
+    run_program(cpu);
 
     d0 = uae_cpu_get_reg(cpu, UAE_REG_D0);
     sr = uae_cpu_get_reg(cpu, UAE_REG_SR);
@@ -129,16 +183,17 @@ static void test_68020_bitfields(void) {
     uae_cpu_config_t cfg;
     memset(&cfg, 0, sizeof(cfg));
     cfg.cpu_type = UAE_CPU_TYPE_68020;
+    apply_test_jit(&cfg);
     uae_cpu_t *cpu = uae_cpu_create(&cfg);
 
     /* Test BFEXTU: Extract 8 bits at offset 12 from 0x01234567 -> 0x34 */
     uint16_t prog_bfextu[] = {
         0x203C, 0x0123, 0x4567, /* MOVE.L #0x01234567, D0 */
-        0xEB80, 0x0308,         /* BFEXTU D0{12:8}, D1 */
-        0x4E71                  /* NOP */
+        0xE9C0, 0x1308,         /* BFEXTU D0{12:8}, D1 */
+        OP_EXEC_RETURN                  /* end */
     };
     setup_test_program(cpu, prog_bfextu, sizeof(prog_bfextu)/2);
-    uae_cpu_execute(cpu, 50);
+    run_program(cpu);
 
     uint32_t d1 = uae_cpu_get_reg(cpu, UAE_REG_D1);
     assert(d1 == 0x34);
@@ -146,11 +201,11 @@ static void test_68020_bitfields(void) {
     /* Test BFFFO: Find first one in 0x00008000 -> offset 16 */
     uint16_t prog_bfffo[] = {
         0x203C, 0x0000, 0x8000, /* MOVE.L #0x00008000, D0 */
-        0xED80, 0x0000,         /* BFFFO D0{0:32}, D1 */
-        0x4E71                  /* NOP */
+        0xEDC0, 0x1000,         /* BFFFO D0{0:32}, D1 */
+        OP_EXEC_RETURN                  /* end */
     };
     setup_test_program(cpu, prog_bfffo, sizeof(prog_bfffo)/2);
-    uae_cpu_execute(cpu, 50);
+    run_program(cpu);
 
     d1 = uae_cpu_get_reg(cpu, UAE_REG_D1);
     assert(d1 == 16);
@@ -164,21 +219,20 @@ static void test_68020_cas(void) {
     uae_cpu_config_t cfg;
     memset(&cfg, 0, sizeof(cfg));
     cfg.cpu_type = UAE_CPU_TYPE_68020;
+    apply_test_jit(&cfg);
     uae_cpu_t *cpu = uae_cpu_create(&cfg);
-
-    /* Memory location 0x2000 has value 0x11112222 */
-    write_mem32(0x2000, 0x11112222);
 
     /* CAS.L D0, D1, (A0) where D0=0x11112222, D1=0x33334444 -> successful swap */
     uint16_t prog_cas[] = {
         0x203C, 0x1111, 0x2222, /* MOVE.L #0x11112222, D0 (compare val) */
         0x223C, 0x3333, 0x4444, /* MOVE.L #0x33334444, D1 (update val) */
         0x207C, 0x0000, 0x2000, /* MOVEA.L #0x2000, A0 */
-        0x0AC8, 0x0841,         /* CAS.L D0, D1, (A0) */
-        0x4E71                  /* NOP */
+        0x0ED0, 0x0040,         /* CAS.L D0, D1, (A0) */
+        OP_EXEC_RETURN                  /* end */
     };
     setup_test_program(cpu, prog_cas, sizeof(prog_cas)/2);
-    uae_cpu_execute(cpu, 50);
+    write_mem32(0x2000, 0x11112222); /* compared with D0 */
+    run_program(cpu);
 
     uint32_t mem_val = read_mem32(0x2000);
     assert(mem_val == 0x33334444);
@@ -194,24 +248,24 @@ static void test_68881_fpu_softfloat(void) {
     cfg.cpu_type = UAE_CPU_TYPE_68040;
     cfg.fpu_type = UAE_FPU_68040;
     cfg.fpu_softfloat = true;
+    apply_test_jit(&cfg);
     uae_cpu_t *cpu = uae_cpu_create(&cfg);
 
     /* Test FMOVE.D and FMUL.D: 3.0 * 4.0 = 12.0 */
-    /* Double 3.0: 0x4008000000000000, Double 4.0: 0x4010000000000000 */
-    write_mem32(0x2000, 0x40080000);
-    write_mem32(0x2004, 0x00000000);
-    write_mem32(0x2008, 0x40100000);
-    write_mem32(0x200C, 0x00000000);
-
     uint16_t prog_fpu[] = {
         0x207C, 0x0000, 0x2000, /* MOVEA.L #0x2000, A0 */
         0xF210, 0x5400,         /* FMOVE.D (A0), FP0 */
         0xF228, 0x5423, 0x0008, /* FMUL.D 8(A0), FP0 */
         0xF228, 0x7400, 0x0010, /* FMOVE.D FP0, 16(A0) (result at 0x2010) */
-        0x4E71                  /* NOP */
+        OP_EXEC_RETURN                  /* end */
     };
     setup_test_program(cpu, prog_fpu, sizeof(prog_fpu)/2);
-    uae_cpu_execute(cpu, 100);
+    /* Double 3.0: 0x4008000000000000, Double 4.0: 0x4010000000000000 */
+    write_mem32(0x2000, 0x40080000);
+    write_mem32(0x2004, 0x00000000);
+    write_mem32(0x2008, 0x40100000);
+    write_mem32(0x200C, 0x00000000);
+    run_program(cpu);
 
     uint32_t res_hi = read_mem32(0x2010);
     uint32_t res_lo = read_mem32(0x2014);
@@ -222,29 +276,26 @@ static void test_68881_fpu_softfloat(void) {
     printf("    -> FPU basic math (FMUL.D 3.0 * 4.0 = 12.0) verified.\n");
 }
 
-static void test_multi_instance_isolation(void) {
-    printf("[*] Testing Multi-Instance Context Isolation...\n");
+static void test_handles_share_one_cpu(void) {
+    printf("[*] Testing that handles share the single CPU instance...\n");
     uae_cpu_config_t cfg;
     memset(&cfg, 0, sizeof(cfg));
     cfg.cpu_type = UAE_CPU_TYPE_68000;
+    apply_test_jit(&cfg);
 
     uae_cpu_t *cpu1 = uae_cpu_create(&cfg);
     uae_cpu_t *cpu2 = uae_cpu_create(&cfg);
 
+    /* The core's state is global: a register set through one handle is
+     * visible through the other. */
     uae_cpu_set_reg(cpu1, UAE_REG_D0, 0x11111111);
-    uae_cpu_set_reg(cpu2, UAE_REG_D0, 0x22222222);
-
-    uae_cpu_set_reg(cpu1, UAE_REG_A0, 0xAAAAAAAA);
     uae_cpu_set_reg(cpu2, UAE_REG_A0, 0xBBBBBBBB);
-
-    assert(uae_cpu_get_reg(cpu1, UAE_REG_D0) == 0x11111111);
-    assert(uae_cpu_get_reg(cpu2, UAE_REG_D0) == 0x22222222);
-    assert(uae_cpu_get_reg(cpu1, UAE_REG_A0) == 0xAAAAAAAA);
-    assert(uae_cpu_get_reg(cpu2, UAE_REG_A0) == 0xBBBBBBBB);
+    assert(uae_cpu_get_reg(cpu2, UAE_REG_D0) == 0x11111111);
+    assert(uae_cpu_get_reg(cpu1, UAE_REG_A0) == 0xBBBBBBBB);
 
     uae_cpu_destroy(cpu1);
     uae_cpu_destroy(cpu2);
-    printf("    -> Multi-instance context isolation verified.\n");
+    printf("    -> Both handles refer to the same CPU.\n");
 }
 
 int main(void) {
@@ -259,7 +310,7 @@ int main(void) {
     test_68020_bitfields();
     test_68020_cas();
     test_68881_fpu_softfloat();
-    test_multi_instance_isolation();
+    test_handles_share_one_cpu();
 
     uae_cpu_global_cleanup();
 

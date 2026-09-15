@@ -85,6 +85,15 @@ extern int do_cycles_cck(int);
 
 #define do_cycles do_cycles_slow
 
+#ifdef JIT
+/* JIT countdown: compiled blocks subtract their cycles and return to C
+ * when it goes negative. pissoff_value is the reload value. */
+extern int pissoff_value;
+extern int pissoff_nojit_value;
+extern int pissoff;
+#define countdown pissoff
+#endif
+
 extern struct ev eventtab[ev_max];
 extern struct ev2 eventtab2[ev2_max];
 

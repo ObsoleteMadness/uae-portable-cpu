@@ -3696,12 +3696,16 @@ static void fpu_test(void)
 
 void fpu_reset (void)
 {
+	/* fpu_mode > 0 selects SoftFloat, 0 the host-double backend the JIT FPU needs. */
 #ifdef WITH_SOFTFLOAT
-	fp_init_softfloat(currprefs.fpu_model);
-	use_long_double = false;
-#else
-	fp_init_native();
+	if (currprefs.fpu_mode > 0) {
+		fp_init_softfloat(currprefs.fpu_model);
+		use_long_double = false;
+	} else
 #endif
+	{
+		fp_init_native();
+	}
 
 	regs.fpu_exp_state = 0;
 	regs.fp_unimp_pend = 0;

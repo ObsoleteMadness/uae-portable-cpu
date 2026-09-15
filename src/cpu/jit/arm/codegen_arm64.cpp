@@ -181,11 +181,23 @@ STATIC_INLINE void LOAD_U64(int r, uae_u64 val)
 
 #define NUM_PUSH_CMDS 1
 #define NUM_POP_CMDS 1
+/*
+ * Translated code is entered through pushall_call_handler and leaves through
+ * the popall stubs. Besides x27/x28 it clobbers d8-d15, which hold 68k FP0-FP7
+ * with jit_fpu and are callee-saved under AAPCS64 (low 64 bits), so save them
+ * too: otherwise a host double held across the call into the JIT is corrupted.
+ */
 STATIC_INLINE void raw_push_regs_to_preserve(void) {
 	STP_xxXpre(27, 28, RSP_INDEX, -16);
+	SUB_xxi(RSP_INDEX, RSP_INDEX, 64);
+	for (int i = 0; i < 8; i++)
+		STR_dXi(8 + i, RSP_INDEX, i * 8);
 }
 
 STATIC_INLINE void raw_pop_preserved_regs(void) {
+	for (int i = 0; i < 8; i++)
+		LDR_dXi(8 + i, RSP_INDEX, i * 8);
+	ADD_xxi(RSP_INDEX, RSP_INDEX, 64);
 	LDP_xxXpost(27, 28, RSP_INDEX, 16);
 }
 

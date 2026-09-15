@@ -16,6 +16,105 @@
 #include <string.h>
 
 addrbank *mem_banks[MEMORY_BANKS];
+
+#ifdef JIT
+uae_u8 *baseaddr[MEMORY_BANKS];
+addrbank kickmem_bank;
+addrbank rtarea_bank;
+addrbank a3000lmem_bank;
+addrbank a3000hmem_bank;
+int special_mem = 0;
+int special_mem_default = 0;
+int jit_n_addr_unsafe = 0;
+int jit_n_addr_bank_unsafe = 0;
+bool canbang = false;
+bool jit_direct_compatible_memory = false;
+uae_u8 *natmem_offset = NULL;
+uae_u8 *natmem_reserved = NULL;
+size_t natmem_reserved_size = 0;
+
+/*
+ * Recomputes the JIT view of one 64K bank after mem_banks[], the JIT memory
+ * base or the direct-access setting changed.
+ *
+ * baseaddr[] gets the bank's host base; banks without a host mapping get a
+ * non-null poison pointer, as in UAE, so a mistaken direct access faults
+ * instead of reading address zero.
+ *
+ * jit_read_flag / jit_write_flag decide whether profiled accesses to the
+ * bank may compile inline. Only a UAE_MEM_JIT_DIRECT region whose host
+ * pointer really is natmem_offset + start qualifies, and only while direct
+ * access is on (canbang): translated code addresses memory as
+ * natmem_offset + address, so any other host pointer would be read from the
+ * wrong place. ROM writes always go through the handler, which drops them.
+ */
+static void jit_sync_baseaddr(int idx)
+{
+    addrbank *bank = mem_banks[idx & 0xFFFF];
+    bool direct;
+
+    if (bank && bank->baseaddr)
+        baseaddr[idx & 0xFFFF] = bank->baseaddr - bank->start;
+    else
+        baseaddr[idx & 0xFFFF] = (uae_u8 *)bank + 1;
+    if (!bank)
+        return;
+    direct = canbang && natmem_offset && bank->baseaddr &&
+             (bank->host_flags & UAE_MEM_JIT_DIRECT) &&
+             bank->baseaddr == natmem_offset + bank->start;
+    bank->jit_read_flag = direct ? 0 : S_READ;
+    bank->jit_write_flag = (direct && !(bank->flags & ABFLAG_ROM)) ? 0 : S_WRITE;
+}
+#define JIT_SYNC_BASEADDR(idx) jit_sync_baseaddr(idx)
+
+/*
+ * Re-applies jit_sync_baseaddr() to every bank, and enables the JIT's
+ * conservative fallback (jit_n_addr_bank_unsafe) while direct access is on
+ * and some region was mapped with UAE_MEM_JIT_UNSAFE_BURST. Called when the
+ * host changes the memory map, the JIT memory base or the JIT settings.
+ */
+void memory_jit_sync_all(void)
+{
+    bool burst = false;
+
+    for (int i = 0; i < MEMORY_BANKS; i++) {
+        jit_sync_baseaddr(i);
+        if (mem_banks[i] && (mem_banks[i]->flags & ABFLAG_JIT_UNSAFE_BURST))
+            burst = true;
+    }
+    jit_n_addr_bank_unsafe = canbang && burst;
+}
+#define JIT_SYNC_ALL() memory_jit_sync_all()
+
+/*
+ * Reads unmapped guest space on behalf of a JIT fault handler.
+ *
+ * The x86 handler emulates a faulting direct access in place and must not
+ * throw, so this never raises a bus error or calls device callbacks.
+ *
+ * Arguments:
+ *   addr: Guest address that faulted.
+ *   size: sz_byte, sz_word or sz_long.
+ *   inst: True for an instruction fetch.
+ *   defvalue: Value unmapped space reads as.
+ *
+ * Returns:
+ *   defvalue, truncated to size.
+ */
+uae_u32 dummy_get_safe(uaecptr addr, int size, bool inst, uae_u32 defvalue)
+{
+    (void)addr;
+    (void)inst;
+    if (size == sz_byte)
+        return defvalue & 0xff;
+    if (size == sz_word)
+        return defvalue & 0xffff;
+    return defvalue;
+}
+#else
+#define JIT_SYNC_BASEADDR(idx) ((void)0)
+#define JIT_SYNC_ALL() ((void)0)
+#endif
 addrbank dummy_bank;
 addrbank musashi_bridge_bank;
 addrbank test_device_bank;
@@ -166,25 +265,25 @@ static void REGPARAM3 musashi_bput(uaecptr addr, uae_u32 b) REGPARAM {
 /* Direct RAM Bank Handlers */
 static uae_u32 REGPARAM3 ram_lget(uaecptr addr) REGPARAM {
     addrbank *bank = &get_mem_bank(addr);
-    uae_u8 *p = bank->baseaddr + (addr & bank->mask);
+    uae_u8 *p = bank->baseaddr + (addr - bank->start);
     return do_get_mem_long((uae_u32 *)p);
 }
 
 static uae_u32 REGPARAM3 ram_wget(uaecptr addr) REGPARAM {
     addrbank *bank = &get_mem_bank(addr);
-    uae_u8 *p = bank->baseaddr + (addr & bank->mask);
+    uae_u8 *p = bank->baseaddr + (addr - bank->start);
     return do_get_mem_word((uae_u16 *)p);
 }
 
 static uae_u32 REGPARAM3 ram_bget(uaecptr addr) REGPARAM {
     addrbank *bank = &get_mem_bank(addr);
-    return bank->baseaddr[addr & bank->mask];
+    return bank->baseaddr[addr - bank->start];
 }
 
 static void REGPARAM3 ram_lput(uaecptr addr, uae_u32 l) REGPARAM {
     addrbank *bank = &get_mem_bank(addr);
     if (!(bank->flags & ABFLAG_ROM)) {
-        uae_u8 *p = bank->baseaddr + (addr & bank->mask);
+        uae_u8 *p = bank->baseaddr + (addr - bank->start);
         do_put_mem_long((uae_u32 *)p, l);
     }
 }
@@ -192,7 +291,7 @@ static void REGPARAM3 ram_lput(uaecptr addr, uae_u32 l) REGPARAM {
 static void REGPARAM3 ram_wput(uaecptr addr, uae_u32 w) REGPARAM {
     addrbank *bank = &get_mem_bank(addr);
     if (!(bank->flags & ABFLAG_ROM)) {
-        uae_u8 *p = bank->baseaddr + (addr & bank->mask);
+        uae_u8 *p = bank->baseaddr + (addr - bank->start);
         do_put_mem_word((uae_u16 *)p, w);
     }
 }
@@ -200,7 +299,7 @@ static void REGPARAM3 ram_wput(uaecptr addr, uae_u32 w) REGPARAM {
 static void REGPARAM3 ram_bput(uaecptr addr, uae_u32 b) REGPARAM {
     addrbank *bank = &get_mem_bank(addr);
     if (!(bank->flags & ABFLAG_ROM)) {
-        bank->baseaddr[addr & bank->mask] = (uae_u8)b;
+        bank->baseaddr[addr - bank->start] = (uae_u8)b;
     }
 }
 
@@ -211,7 +310,7 @@ static int REGPARAM3 ram_check(uaecptr addr, uae_u32 size) REGPARAM {
 
 static uae_u8 *REGPARAM3 ram_xlate(uaecptr addr) REGPARAM {
     addrbank *bank = &get_mem_bank(addr);
-    return bank->baseaddr + (addr & bank->mask);
+    return bank->baseaddr + (addr - bank->start);
 }
 
 /* Custom Bank Handlers */
@@ -366,6 +465,7 @@ void memory_init(void) {
 
     for (int i = 0; i < MEMORY_BANKS; i++) {
         mem_banks[i] = &dummy_bank;
+        JIT_SYNC_BASEADDR(i);
         ce_cachable[i] = 0;
         ce_banktype[i] = CE_MEMBANK_NONE;
     }
@@ -390,11 +490,13 @@ void memory_uninit(void) {
             for (int j = i + 1; j < MEMORY_BANKS; j++) {
                 if (mem_banks[j] == bank) {
                     mem_banks[j] = &dummy_bank;
+                    JIT_SYNC_BASEADDR(j);
                 }
             }
             free(bank);
         }
         mem_banks[i] = &dummy_bank;
+        JIT_SYNC_BASEADDR(i);
     }
 }
 
@@ -403,6 +505,7 @@ void map_banks(addrbank *bank, int start, int size, int realsize) {
     for (int i = 0; i < size; i++) {
         int bank_idx = (start + i) & 0xFFFF;
         mem_banks[bank_idx] = bank;
+        JIT_SYNC_BASEADDR(bank_idx);
     }
 }
 
@@ -423,21 +526,25 @@ int memory_map_ptr(uint32_t start_addr, uint32_t size, uint8_t *host_ptr, uint32
     bank->xlateaddr = ram_xlate;
     bank->check = ram_check;
     bank->baseaddr = host_ptr;
+    bank->start = start_addr;
+    bank->allocated_size = size;
     bank->mask = size - 1;
     bank->flags = ABFLAG_RAM | ((flags & UAE_MEM_ROM) ? ABFLAG_ROM : 0);
     bank->host_flags = flags;
-    /* Only regions the host declared JIT-direct may be accessed inline; ROM writes never are. */
-    bank->jit_read_flag = (flags & UAE_MEM_JIT_DIRECT) ? 0 : S_READ;
-    bank->jit_write_flag = ((flags & UAE_MEM_JIT_DIRECT) && !(flags & UAE_MEM_ROM)) ? 0 : S_WRITE;
+    /* Inline JIT access is decided per bank by JIT_SYNC_BASEADDR(). */
+    bank->jit_read_flag = S_READ;
+    bank->jit_write_flag = S_WRITE;
     if (flags & UAE_MEM_JIT_UNSAFE_BURST)
         bank->flags |= ABFLAG_JIT_UNSAFE_BURST;
 
     for (int i = 0; i < num_banks; i++) {
         int idx = (start_bank + i) & 0xFFFF;
         mem_banks[idx] = bank;
+        JIT_SYNC_BASEADDR(idx);
         ce_cachable[idx] = (flags & UAE_MEM_CACHEABLE) ? 1 : 0;
         ce_banktype[idx] = CE_MEMBANK_FAST32;
     }
+    JIT_SYNC_ALL();
     return 0;
 }
 
@@ -452,6 +559,8 @@ int memory_map_custom(uint32_t start_addr, uint32_t size,
     if (!bank) return -1;
 
     bank->name = "custom";
+    bank->label = "custom";
+    bank->start = start_addr;
     bank->lget = custom_lget;
     bank->wget = custom_wget;
     bank->bget = custom_bget;
@@ -475,7 +584,9 @@ int memory_map_custom(uint32_t start_addr, uint32_t size,
     for (int i = 0; i < num_banks; i++) {
         int idx = (start_bank + i) & 0xFFFF;
         mem_banks[idx] = bank;
+        JIT_SYNC_BASEADDR(idx);
     }
+    JIT_SYNC_ALL();
     return 0;
 }
 
@@ -493,6 +604,7 @@ void memory_unmap(uint32_t start_addr, uint32_t size) {
     for (int i = 0; i < num_banks; i++) {
         int idx = (start_bank + i) & 0xFFFF;
         mem_banks[idx] = &dummy_bank;
+        JIT_SYNC_BASEADDR(idx);
         ce_cachable[idx] = 0;
         ce_banktype[idx] = CE_MEMBANK_NONE;
     }
@@ -507,6 +619,7 @@ void memory_unmap(uint32_t start_addr, uint32_t size) {
             free(bank_to_free);
         }
     }
+    JIT_SYNC_ALL();
 }
 
 /*

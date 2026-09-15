@@ -54,8 +54,9 @@ typedef enum {
     UAE_MEM_ROM       = 0x02,
     UAE_MEM_IO        = 0x04,
     UAE_MEM_CACHEABLE = 0x08,
-    UAE_MEM_JIT_DIRECT = 0x10,       /* Safe for JIT-inlined host-pointer access */
-    UAE_MEM_JIT_UNSAFE_BURST = 0x20  /* Keep MOVEM/MOVE16 bursts on per-access helpers */
+    UAE_MEM_JIT_DIRECT = 0x10,       /* With jit_direct_memory: translated code may access the region inline */
+    UAE_MEM_JIT_UNSAFE_BURST = 0x20  /* With jit_direct_memory: conservative mode for maps where a burst
+                                      * (MOVEM, MOVE16) can run off a direct region; see README */
 } uae_mem_flags_t;
 
 /* Registers enumeration */
@@ -98,12 +99,22 @@ typedef struct {
     uae_cpu_type_t cpu_type;
     uae_fpu_type_t fpu_type;
     uae_mmu_type_t mmu_type;
-    bool fpu_softfloat;      /* true = use SoftFloat, false = host native */
+    bool fpu_softfloat;      /* true = SoftFloat (80-bit extended precision); false = host doubles
+                              * (faster, double precision; required for jit_fpu) */
     bool address_space_24;   /* true = 24-bit addressing (e.g. 68000, 68EC020) */
     int timing_mode;         /* 0 = fast/standard, 1 = prefetch, 2 = cycle-exact */
-    bool jit_enabled;        /* true = enable dynamic translation if available */
-    uint32_t jit_cache_size; /* JIT code cache size in KB (e.g. 8192) */
+    bool jit_enabled;        /* true = run 68020+ code through the JIT when the library has one */
+    uint32_t jit_cache_size; /* JIT code cache size in KB (0 = 8192) */
     bool unmapped_bus_error; /* true = access to an unmapped address raises a bus error */
+    bool jit_follow_cacr;    /* true = translate only while the guest has the CPU cache enabled
+                              * (CACR, WinUAE behaviour); false = always translate */
+    bool jit_direct_memory;  /* true = translated code reads and writes UAE_MEM_JIT_DIRECT regions
+                              * inline through the JIT memory base instead of calling the region
+                              * handlers; see uae_cpu_set_jit_memory_base() */
+    bool jit_fpu;            /* true = also translate FPU instructions (WinUAE "JIT FPU"). Takes
+                              * effect only with jit_enabled, jit_direct_memory, an FPU and
+                              * fpu_softfloat = false: translated FPU code works on host doubles
+                              * and moves values through the JIT memory base */
 } uae_cpu_config_t;
 
 /* Memory Read/Write Callbacks for custom mapped devices */
@@ -180,7 +191,12 @@ typedef struct {
     uint32_t (*dbf_spin)(void *userdata, int dreg, uint16_t count);
 } uae_cpu_host_hooks_t;
 
-/* Opaque CPU Instance Handle */
+/*
+ * Opaque CPU handle. The core is single-instance: CPU state, the memory map,
+ * hooks and the JIT cache are global, so every handle refers to the same CPU
+ * and uae_cpu_create() does not give an independent core. Drive the CPU from
+ * one thread; only the calls marked thread-safe may be made from others.
+ */
 typedef struct uae_cpu_instance uae_cpu_t;
 
 /* Global Init / Cleanup */
@@ -265,9 +281,38 @@ uint64_t uae_cpu_get_cycles(uae_cpu_t *cpu);    /* Monotonic CPU cycles since th
  * or hooks during execution; it has no effect outside uae_cpu_execute/step. */
 void     uae_cpu_raise_bus_error(uae_cpu_t *cpu, uint32_t addr, bool is_write, int size);
 
-/* Discard translated code overlapping [addr, addr + size); size ~0 flushes
- * everything. No-op while the library is built without a JIT. */
+/* Discard translated code that may overlap [addr, addr + size). Blocks are
+ * checksummed before reuse, so any size > 0 is safe. No-op without a JIT. */
 void     uae_cpu_invalidate_code(uae_cpu_t *cpu, uint32_t addr, uint32_t size);
+
+/*
+ * Declares a flat guest window for the JIT: for guest code the JIT may
+ * translate, the host byte for guest address a must be base + a. Translated
+ * code derives the 68k PC from host pointers through this base, so the JIT
+ * only compiles code in regions mapped with uae_cpu_map_memory() whose host
+ * pointer equals base + start (for example one reservation covering the whole
+ * guest address space, or a RAM buffer mapped at guest address 0). Code
+ * anywhere else, and all code while no base is set, runs through the
+ * interpreter. Returns 0, or -1 when the library has no JIT.
+ *
+ * With jit_direct_memory, translated code also reads and writes
+ * UAE_MEM_JIT_DIRECT regions whose host pointer equals base + start at
+ * base + address, without calling handlers. Each block is profiled in the
+ * interpreter before it is compiled: accesses that touched only such regions
+ * are inlined, the rest keep the handler call. A later access by the same
+ * instruction to a different address still goes to base + address, so the
+ * window must cover every address translated code can reach (typically one
+ * 4 GB reservation with RAM, ROM and video memory committed in place). If
+ * such an access faults in an uncommitted part of the window, the x86-64
+ * and Windows ARM64 JITs recover and complete it through the region's
+ * handler; on AArch64 Linux and macOS the fault reaches the host's
+ * SIGSEGV/SIGBUS handler.
+ */
+int      uae_cpu_set_jit_memory_base(uae_cpu_t *cpu, uint8_t *base);
+
+/* Bytes of translated host code currently in the JIT cache; 0 when the JIT
+ * is off or not built. */
+uint32_t uae_cpu_get_jit_code_size(uae_cpu_t *cpu);
 
 /* uae_mem_flags_t bits of the region containing addr; 0 when unmapped. */
 uint32_t uae_cpu_get_mem_flags(uae_cpu_t *cpu, uint32_t addr);

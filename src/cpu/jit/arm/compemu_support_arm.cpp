@@ -1273,6 +1273,8 @@ static LONG CALLBACK windows_arm64_jit_exception_handler(PEXCEPTION_POINTERS inf
 				write_log(_T("JIT: Windows ARM64 dummy_bank store at %08x ignored\n"), amiga_addr);
 			}
 		} else if (transfer_type == TYPE_LOAD) {
+			/* Compiled-code register state: region handlers must not unwind. */
+			g_jit_in_fault_recovery = true;
 			uae_u32 newval = get_reg_w(rd);
 			switch (transfer_size) {
 			case SIZE_BYTE:
@@ -1288,7 +1290,9 @@ static LONG CALLBACK windows_arm64_jit_exception_handler(PEXCEPTION_POINTERS inf
 				break;
 			}
 			set_reg_w(rd, newval);
+			g_jit_in_fault_recovery = false;
 		} else {
+			g_jit_in_fault_recovery = true;
 			const uae_u32 regval = get_reg_w(rd);
 			switch (transfer_size) {
 			case SIZE_BYTE:
@@ -1303,6 +1307,7 @@ static LONG CALLBACK windows_arm64_jit_exception_handler(PEXCEPTION_POINTERS inf
 			default:
 				break;
 			}
+			g_jit_in_fault_recovery = false;
 		}
 
 		info->ContextRecord->Pc += 4;
@@ -3109,19 +3114,27 @@ static inline bool arm64_cache_reaches_popall(uint8 *cache_start, uint32 cache_s
 		arm64_uncond_branch_reachable(end, popall);
 }
 
-#if defined(__APPLE__)
+/*
+ * Allocates the translation cache within B/BL range (+-128 MB) of popallspace.
+ * create_popalls() normally allocates both as one block, but when the cache is
+ * (re)allocated later (for example, the JIT is enabled after the CPU was first
+ * configured without it) a plain allocation can land anywhere: out of range,
+ * alloc_cache() halves the size down to zero and the JIT silently stays off.
+ * Probe hint addresses around popallspace instead.
+ */
 static uint8 *alloc_code_near_popall(uint32 size)
 {
 	if (!popallspace || size == 0) {
 		return alloc_code(size);
 	}
-#ifdef MAP_JIT
-	const int prot = PROT_READ | PROT_WRITE | PROT_EXEC;
-	const int flags = MAP_PRIVATE | MAP_ANON | MAP_JIT;
-	const uintptr page = (uintptr)uae_vm_page_size();
 	const uintptr anchor = (uintptr)popallspace;
 	const intptr_t max_delta = 120 * 1024 * 1024;
 	const intptr_t step = 4 * 1024 * 1024;
+#if defined(_WIN32)
+	const uintptr granularity = 0x10000; /* VirtualAlloc allocation granularity */
+#else
+	const uintptr granularity = (uintptr)uae_vm_page_size();
+#endif
 
 	for (intptr_t delta = 0; delta <= max_delta; delta += step) {
 		for (int dir = 0; dir < 2; dir++) {
@@ -3129,24 +3142,37 @@ static uint8 *alloc_code_near_popall(uint32 size)
 				continue;
 			}
 			const intptr_t signed_delta = dir == 0 ? delta : -delta;
-			uintptr hint = (uintptr)((intptr_t)anchor + signed_delta);
-			hint &= ~(page - 1);
-			void *p = mmap((void *)hint, size, prot, flags, -1, 0);
+			const uintptr hint = (uintptr)((intptr_t)anchor + signed_delta) & ~(granularity - 1);
+			uint8 *code;
+#if defined(_WIN32)
+			code = (uint8 *)VirtualAlloc((LPVOID)hint, size, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+			if (!code) {
+				continue;
+			}
+#else
+			int flags = MAP_PRIVATE | MAP_ANON;
+#if defined(__APPLE__) && defined(MAP_JIT)
+			flags |= MAP_JIT;
+#endif
+			void *p = mmap((void *)hint, size, PROT_READ | PROT_WRITE | PROT_EXEC, flags, -1, 0);
 			if (p == MAP_FAILED) {
 				continue;
 			}
-			uint8 *code = (uint8 *)p;
+			code = (uint8 *)p;
+#endif
 			if (arm64_cache_reaches_popall(code, size)) {
 				return code;
 			}
+#if defined(_WIN32)
+			VirtualFree(code, 0, MEM_RELEASE);
+#else
 			munmap(code, size);
+#endif
 		}
 	}
-#endif
 	/* Fallback allocation may place cache out of branch range, checked by caller. */
 	return alloc_code(size);
 }
-#endif /* __APPLE__ */
 #endif /* CPU_AARCH64 */
 
 void alloc_cache(void)
@@ -3176,11 +3202,7 @@ void alloc_cache(void)
 		/* Fall back to separate allocation */
 		while (!compiled_code && cache_size) {
 			const uint32 cache_bytes = cache_size * 1024;
-#if defined(__APPLE__)
 			compiled_code = alloc_code_near_popall(cache_bytes);
-#else
-			compiled_code = alloc_code(cache_bytes);
-#endif
 			if (compiled_code && !arm64_cache_reaches_popall(compiled_code, cache_bytes)) {
 				jit_log("ARM64: JIT cache %p (size %u) is out of branch range from popallspace %p",
 					compiled_code, cache_bytes, popallspace);
@@ -3731,6 +3753,14 @@ void build_comp(void)
     }
 
     int count = 0;
+    /* Host hooks: opcodes the host must see run through their C handlers. */
+    for (opcode = 0; opcode < 65536; opcode++) {
+    	if (uae_host_jit_must_interpret(opcode)) {
+    		compfunctbl[cft_map(opcode)] = NULL;
+    		nfcompfunctbl[cft_map(opcode)] = NULL;
+    	}
+    }
+
     for (opcode = 0; opcode < 65536; opcode++) {
         if (compfunctbl[cft_map(opcode)])
             count++;

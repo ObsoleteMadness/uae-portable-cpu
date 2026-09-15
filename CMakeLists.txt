@@ -9,6 +9,8 @@ option(BUILD_SHARED_LIBS "Build shared libraries" OFF)
 option(ENABLE_TESTS "Build tests" ON)
 option(UAE_CPU_MUSASHI_API "Build the Musashi-compatible m68k_* API (include/m68k.h)" ON)
 option(UAE_CPU_ISOLATE_SYMBOLS "Also build uaecpu_isolated, a static library exporting only the public API" OFF)
+set(UAE_CPU_JIT "AUTO" CACHE STRING "Build the 680x0 JIT compiler: AUTO (on for supported hosts), ON or OFF")
+set_property(CACHE UAE_CPU_JIT PROPERTY STRINGS AUTO ON OFF)
 
 include(GNUInstallDirs)
 include(CMakePackageConfigHelpers)
@@ -88,6 +90,38 @@ if(UAE_CPU_MUSASHI_API)
     list(APPEND CORE_SOURCES src/api/musashi_api.c)
 endif()
 
+# JIT: AArch64 and x86-64 backends from WinUAE / ARAnyM / Amiberry.
+if(CMAKE_OSX_ARCHITECTURES)
+    set(UAE_CPU_JIT_PROCESSOR "${CMAKE_OSX_ARCHITECTURES}")
+else()
+    set(UAE_CPU_JIT_PROCESSOR "${CMAKE_SYSTEM_PROCESSOR}")
+endif()
+string(TOLOWER "${UAE_CPU_JIT_PROCESSOR}" UAE_CPU_JIT_PROCESSOR)
+set(UAE_CPU_JIT_SUPPORTED OFF)
+if(UAE_CPU_JIT_PROCESSOR MATCHES "^(arm64|aarch64|x86_64|amd64)$")
+    set(UAE_CPU_JIT_SUPPORTED ON)
+endif()
+if(UAE_CPU_JIT STREQUAL "ON" AND NOT UAE_CPU_JIT_SUPPORTED)
+    message(FATAL_ERROR "UAE_CPU_JIT=ON: no JIT backend for '${UAE_CPU_JIT_PROCESSOR}' with this compiler")
+endif()
+if(UAE_CPU_JIT STREQUAL "ON" OR (UAE_CPU_JIT STREQUAL "AUTO" AND UAE_CPU_JIT_SUPPORTED))
+    set(UAE_CPU_JIT_ENABLED ON)
+else()
+    set(UAE_CPU_JIT_ENABLED OFF)
+endif()
+message(STATUS "uae-portable-cpu: JIT ${UAE_CPU_JIT_ENABLED} (${UAE_CPU_JIT_PROCESSOR})")
+
+set(JIT_SOURCES
+    src/cpu/vm.c
+    src/cpu/jit/compemu.cpp
+    src/cpu/jit/compemu_support.cpp
+    src/cpu/jit/compstbl.cpp
+    src/cpu/jit/compemu_fpp.cpp
+)
+if(UAE_CPU_JIT_ENABLED)
+    list(APPEND CORE_SOURCES ${JIT_SOURCES})
+endif()
+
 if(CMAKE_C_COMPILER_ID MATCHES "Clang|AppleClang|GNU")
     set_source_files_properties(${CPUEMU_SOURCES} PROPERTIES COMPILE_FLAGS "-Wno-sign-compare -Wno-unused-variable -Wno-unused-function -Wno-parentheses -fwrapv")
     set_source_files_properties(src/cpu/newcpu.c src/cpu/newcpu_common.c src/cpu/cpummu.c src/cpu/cpummu030.c PROPERTIES COMPILE_FLAGS "-Wno-unused-variable -Wno-unused-function -fwrapv")
@@ -105,6 +139,20 @@ target_include_directories(uaecpu PUBLIC
 )
 
 target_compile_definitions(uaecpu PRIVATE UAE_CPU_MUSASHI_API=$<BOOL:${UAE_CPU_MUSASHI_API}>)
+if(UAE_CPU_JIT_ENABLED)
+    target_compile_definitions(uaecpu PRIVATE JIT USE_JIT_FPU NATMEM_OFFSET=natmem_offset)
+    target_include_directories(uaecpu PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/cpu/jit)
+    # Upstream JIT sources: warnings off. MSVC needs /bigobj for the generated
+    # opcode compilers (compemu_x86.cpp alone is over 100,000 lines).
+    if(MSVC)
+        set(UAE_CPU_JIT_SOURCE_FLAGS "/w /bigobj")
+    else()
+        set(UAE_CPU_JIT_SOURCE_FLAGS "-w -fwrapv")
+    endif()
+    set_source_files_properties(src/cpu/jit/compemu.cpp src/cpu/jit/compemu_support.cpp
+        src/cpu/jit/compstbl.cpp src/cpu/jit/compemu_fpp.cpp
+        PROPERTIES COMPILE_FLAGS "${UAE_CPU_JIT_SOURCE_FLAGS}")
+endif()
 # Real definitions instead of C "common" symbols: the linker cannot hide a
 # common symbol, which would leak internals such as regs out of uaecpu_isolated.
 if(NOT MSVC)
@@ -232,6 +280,22 @@ if(ENABLE_TESTS)
     target_link_libraries(test_host_hooks PRIVATE uaecpu)
     add_test(NAME host_hooks COMMAND test_host_hooks)
 
+    # Throughput benchmark (bench/). The test only checks that every mode
+    # produces the reference results; run uae_cpu_bench directly for timings.
+    add_executable(uae_cpu_bench bench/uae_cpu_bench.c)
+    target_link_libraries(uae_cpu_bench PRIVATE uaecpu)
+    add_test(NAME bench_smoke COMMAND uae_cpu_bench --quick --repeat 1)
+
+    if(UAE_CPU_JIT_ENABLED)
+        # The same suites again with every 68020+ scenario running under the JIT.
+        add_test(NAME test_uae_cpu_jit COMMAND test_uae_cpu)
+        add_test(NAME host_hooks_jit COMMAND test_host_hooks)
+        set_tests_properties(test_uae_cpu_jit host_hooks_jit PROPERTIES ENVIRONMENT UAE_TEST_JIT=1)
+        # And once more with jit_direct_memory in a 4 GB guest reservation.
+        add_test(NAME host_hooks_jit_direct COMMAND test_host_hooks)
+        set_tests_properties(host_hooks_jit_direct PROPERTIES ENVIRONMENT "UAE_TEST_JIT=1;UAE_TEST_JIT_DIRECT=1")
+    endif()
+
     if(UAE_CPU_MUSASHI_API)
         add_executable(test_basic tests/test_basic.c)
         target_link_libraries(test_basic PRIVATE uaecpu)
@@ -247,6 +311,21 @@ if(ENABLE_TESTS)
         add_test(NAME musashi_68040 COMMAND test_musashi_suite ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/musashi/mc68040 68040)
         add_test(NAME m68k_rs_coverage COMMAND test_m68k_rs_suite ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/m68k-rs/extra/coverage/bin 68040)
         add_test(NAME m68k_rs_extra COMMAND test_m68k_rs_suite ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/m68k-rs/extra 68040)
+
+        if(UAE_CPU_JIT_ENABLED)
+            # 68040 fixture suites with the JIT enabled. The m68k-rs driver maps its
+            # RAM/ROM into a flat JIT window, so those programs are translated; the
+            # Musashi fixtures use callback-only memory and exercise the dispatcher's
+            # interpreter fallback.
+            add_test(NAME musashi_68040_jit COMMAND test_musashi_suite ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/musashi/mc68040 68040)
+            add_test(NAME m68k_rs_coverage_jit COMMAND test_m68k_rs_suite ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/m68k-rs/extra/coverage/bin 68040)
+            add_test(NAME m68k_rs_extra_jit COMMAND test_m68k_rs_suite ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/m68k-rs/extra 68040)
+            set_tests_properties(musashi_68040_jit m68k_rs_coverage_jit m68k_rs_extra_jit PROPERTIES ENVIRONMENT UAE_TEST_JIT=1)
+            # m68k-rs again with jit_direct_memory: RAM and ROM are accessed inline.
+            add_test(NAME m68k_rs_coverage_jit_direct COMMAND test_m68k_rs_suite ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/m68k-rs/extra/coverage/bin 68040)
+            add_test(NAME m68k_rs_extra_jit_direct COMMAND test_m68k_rs_suite ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/m68k-rs/extra 68040)
+            set_tests_properties(m68k_rs_coverage_jit_direct m68k_rs_extra_jit_direct PROPERTIES ENVIRONMENT "UAE_TEST_JIT=1;UAE_TEST_JIT_DIRECT=1")
+        endif()
     endif()
 
     if(UAE_CPU_ISOLATE_SYMBOLS)

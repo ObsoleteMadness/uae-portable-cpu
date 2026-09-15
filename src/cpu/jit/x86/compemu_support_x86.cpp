@@ -111,6 +111,12 @@ static void build_comp(void);
 #if defined(CPU_x86_64) && !defined(_WIN32)
 #include <sys/mman.h>
 #endif
+#if defined(CPU_x86_64) && defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#endif
 #if defined(CPU_x86_64) && defined(__APPLE__)
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
@@ -5356,6 +5362,14 @@ void build_comp(void)
 	}
 
 	count=0;
+	/* Host hooks: opcodes the host must see run through their C handlers. */
+	for (opcode = 0; opcode < 65536; opcode++) {
+		if (uae_host_jit_must_interpret(opcode)) {
+			compfunctbl[cft_map(opcode)] = NULL;
+			nfcompfunctbl[cft_map(opcode)] = NULL;
+		}
+	}
+
 	for (opcode = 0; opcode < 65536; opcode++) {
 		if (compfunctbl[cft_map(opcode)])
 			count++;

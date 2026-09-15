@@ -3,6 +3,7 @@
  */
 
 #include "m68k.h"
+#include "uae_cpu.h"
 #include <assert.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -11,6 +12,13 @@
 #include "portable_dirent.h"
 #include <sys/types.h>
 #include <sys/stat.h>
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+#else
+#include <sys/mman.h>
+#endif
 
 unsigned int m68k_read_disassembler_16(unsigned int address) {
     (void)address;
@@ -297,6 +305,101 @@ static void setup_bootsec(void) {
     m68k_write_memory_32(4, 0x10000);
 }
 
+/*
+ * UAE_TEST_JIT=1: after the Musashi-compatible setup, reconfigure the same
+ * CPU through the context API with the JIT enabled, so 68020+ fixtures run
+ * as translated code.
+ */
+static bool test_flat_memory(void) {
+    return getenv("UAE_TEST_JIT") || getenv("UAE_TEST_JIT_INTERP");
+}
+
+static void apply_test_jit(unsigned int cpu_type) {
+    uae_cpu_config_t cfg;
+    if (!test_flat_memory())
+        return;
+    memset(&cfg, 0, sizeof(cfg));
+    switch (cpu_type) {
+    case M68K_CPU_TYPE_68020: cfg.cpu_type = UAE_CPU_TYPE_68020; cfg.fpu_type = UAE_FPU_68881; break;
+    case M68K_CPU_TYPE_68030: cfg.cpu_type = UAE_CPU_TYPE_68030; cfg.fpu_type = UAE_FPU_68882; break;
+    case M68K_CPU_TYPE_68040: cfg.cpu_type = UAE_CPU_TYPE_68040; cfg.fpu_type = UAE_FPU_68040; break;
+    default: return;  /* the JIT needs a 68020 or later */
+    }
+    cfg.fpu_softfloat = true;
+    /* UAE_TEST_JIT_INTERP keeps the flat memory model but runs the interpreter,
+     * so a JIT-vs-interpreter diff compares like with like. */
+    cfg.jit_enabled = getenv("UAE_TEST_JIT") != NULL;
+    cfg.jit_cache_size = 8192;
+    cfg.jit_direct_memory = cfg.jit_enabled && getenv("UAE_TEST_JIT_DIRECT") != NULL;
+    uae_cpu_set_config(NULL, &cfg);
+}
+
+/*
+ * UAE_TEST_JIT=1: copy the fixture's RAM and ROM slots into one flat host
+ * buffer, map it through the context API and make it the JIT memory base, so
+ * the test programs (which run from ROM) are actually translated. The test
+ * device and 24-bit mirrors stay on the Musashi-compatible callbacks. ROM is
+ * mapped read-only: writes are dropped rather than raising the slot's bus
+ * error.
+ *
+ * UAE_TEST_JIT_DIRECT=1 adds jit_direct_memory. Inlined accesses reach
+ * base + any address, so the buffer is then the start of a 4 GB reservation
+ * with only the first JIT_FLAT_SIZE bytes accessible.
+ */
+#define JIT_FLAT_SIZE 0x400000
+static uint8_t *g_jit_flat;
+
+static bool alloc_jit_flat(void) {
+    if (g_jit_flat)
+        return true;
+#if defined(_WIN64)
+    if (getenv("UAE_TEST_JIT_DIRECT")) {
+        void *p = VirtualAlloc(NULL, (SIZE_T)1 << 32, MEM_RESERVE, PAGE_NOACCESS);
+        if (!p || !VirtualAlloc(p, JIT_FLAT_SIZE, MEM_COMMIT, PAGE_READWRITE))
+            return false;
+        g_jit_flat = (uint8_t *)p;
+        return true;
+    }
+#elif !defined(_WIN32) && UINTPTR_MAX > 0xFFFFFFFFu
+    if (getenv("UAE_TEST_JIT_DIRECT")) {
+        int flags = MAP_PRIVATE | MAP_ANON;
+#ifdef MAP_NORESERVE
+        flags |= MAP_NORESERVE;
+#endif
+        void *p = mmap(NULL, (size_t)1 << 32, PROT_NONE, flags, -1, 0);
+        if (p == MAP_FAILED || mprotect(p, JIT_FLAT_SIZE, PROT_READ | PROT_WRITE) != 0)
+            return false;
+        g_jit_flat = (uint8_t *)p;
+        return true;
+    }
+#endif
+    g_jit_flat = (uint8_t *)calloc(1, JIT_FLAT_SIZE);
+    return g_jit_flat != NULL;
+}
+
+static uint64_t g_jit_translated_bytes;  /* summed over fixtures, printed at the end */
+
+static void apply_test_jit_memory(void) {
+    uint32_t direct = getenv("UAE_TEST_JIT_DIRECT") ? UAE_MEM_JIT_DIRECT : 0;
+    if (!test_flat_memory())
+        return;
+    if (!alloc_jit_flat()) {
+        fprintf(stderr, "Cannot allocate the flat JIT window\n");
+        exit(2);
+    }
+    memset(g_jit_flat, 0, JIT_FLAT_SIZE);
+    memcpy(g_jit_flat, g_stack.memory, RAM_SLOT_SIZE);
+    uae_cpu_map_memory(NULL, 0, RAM_SLOT_SIZE, g_jit_flat, UAE_MEM_RAM | direct);
+    for (unsigned i = 0; i < N_ROMS; ++i) {
+        uint32_t base = RAM_SLOT_SIZE + ROM_SLOT_SIZE * i;
+        memcpy(g_jit_flat + base, g_roms[i].memory, ROM_SLOT_SIZE);
+        uae_cpu_map_memory(NULL, base, ROM_SLOT_SIZE, g_jit_flat + base, UAE_MEM_ROM | direct);
+    }
+    memcpy(g_jit_flat + 0x300000, g_extra_ram1.memory, RAM_SLOT_SIZE);
+    uae_cpu_map_memory(NULL, 0x300000, RAM_SLOT_SIZE, g_jit_flat + 0x300000, UAE_MEM_RAM | direct);
+    uae_cpu_set_jit_memory_base(NULL, g_jit_flat);
+}
+
 static int run_single_test(const char* bin_path, unsigned int cpu_type, int verbose) {
     FILE *infile = fopen(bin_path, "rb");
     if (!infile) {
@@ -313,10 +416,12 @@ static int run_single_test(const char* bin_path, unsigned int cpu_type, int verb
 
     m68k_init();
     m68k_set_cpu_type(cpu_type);
+    apply_test_jit(cpu_type);
 
     test_device_init(&g_test_dev);
     setup_memory();
     setup_bootsec();
+    apply_test_jit_memory();
 
     m68k_pulse_reset();
 
@@ -343,6 +448,7 @@ static int run_single_test(const char* bin_path, unsigned int cpu_type, int verb
             last_pc = pc;
         }
     }
+    g_jit_translated_bytes += uae_cpu_get_jit_code_size(NULL);
 
     if (verbose) {
         printf("    pass=%u, fail=%u\n", g_test_dev.test_pass_count, g_test_dev.test_fail_count);
@@ -481,6 +587,8 @@ int main(int argc, char* argv[]) {
     printf("Passed:    %d\n", passed);
     printf("Failed:    %d\n", failed);
     printf("Pass Rate: %.1f%%\n", (double)passed * 100.0 / (total ? total : 1));
+    if (getenv("UAE_TEST_JIT"))
+        printf("JIT translated: %llu bytes\n", (unsigned long long)g_jit_translated_bytes);
 
     if (passed >= total * 0.80 && passed > 0) {
         printf("\n>>> M68K-RS FIXTURE VERIFICATION SUCCESS (Pass Rate >= 80%%) <<<\n\n");

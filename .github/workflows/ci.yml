@@ -31,6 +31,27 @@ jobs:
       - name: Run CTest
         run: ctest --test-dir build -C Release --output-on-failure
 
+      # Timings go to the job summary and a CSV artifact for comparing runs.
+      # Shared runners are noisy, so only wrong results fail the step.
+      - name: Benchmark
+        shell: bash
+        run: |
+          bin=build/uae_cpu_bench
+          [ -x "$bin" ] || bin=build/Release/uae_cpu_bench.exe
+          {
+            echo "### Benchmark (${{ matrix.os }})"
+            echo '```'
+            "$bin" --csv bench-${{ matrix.os }}.csv || touch bench-failed
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+          test ! -e bench-failed
+
+      - name: Upload benchmark results
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-${{ matrix.os }}
+          path: bench-${{ matrix.os }}.csv
+
       - name: Test CMake Install
         run: cmake --install build --config Release --prefix install_test
 
@@ -53,6 +74,99 @@ jobs:
           -DENABLE_TESTS=ON
           -DUAE_CPU_MUSASHI_API=OFF
           -DUAE_CPU_ISOLATE_SYMBOLS=ON
+
+      - name: Build
+        run: cmake --build build --config Release -j
+
+      - name: Run CTest
+        run: ctest --test-dir build -C Release --output-on-failure
+
+  jit-windows-msvc:
+    name: JIT on Windows, MSVC (${{ matrix.arch }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            os: windows-latest
+          - arch: ARM64
+            os: windows-11-arm
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure CMake
+        run: >
+          cmake -B build -A ${{ matrix.arch }}
+          -DENABLE_TESTS=ON
+          -DUAE_CPU_JIT=ON
+
+      - name: Build
+        run: cmake --build build --config Release -j
+
+      - name: Run CTest
+        run: ctest --test-dir build -C Release --output-on-failure
+
+      - name: Benchmark
+        run: build/Release/uae_cpu_bench.exe --repeat 1
+
+  jit-windows-mingw:
+    name: JIT on Windows, MinGW-w64 (UCRT64)
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up MSYS2
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-cmake
+            mingw-w64-ucrt-x86_64-ninja
+
+      - name: Configure CMake
+        run: >
+          cmake -B build -G Ninja
+          -DCMAKE_BUILD_TYPE=Release
+          -DENABLE_TESTS=ON
+          -DUAE_CPU_JIT=ON
+
+      - name: Build
+        run: cmake --build build -j
+
+      - name: Run CTest
+        run: ctest --test-dir build --output-on-failure
+
+      - name: Benchmark
+        run: ./build/uae_cpu_bench.exe --repeat 1
+
+  no-jit:
+    name: Interpreter only, UAE_CPU_JIT=OFF (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ ubuntu-latest, macos-latest ]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure CMake
+        run: >
+          cmake -B build
+          -DCMAKE_BUILD_TYPE=Release
+          -DENABLE_TESTS=ON
+          -DUAE_CPU_JIT=OFF
 
       - name: Build
         run: cmake --build build --config Release -j

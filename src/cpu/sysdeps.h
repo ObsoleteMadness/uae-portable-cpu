@@ -67,6 +67,10 @@
 
 #define STATIC_INLINE static inline
 
+#ifndef _WIN32
+#define _stricmp strcasecmp
+#define _strnicmp strncasecmp
+#endif
 #ifdef _WIN32
 #define strcasecmp _stricmp
 #define strncasecmp _strnicmp
