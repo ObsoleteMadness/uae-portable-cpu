@@ -186,7 +186,12 @@ typedef struct {
     uint32_t (*dbf_spin)(void *userdata, int dreg, uint16_t count);
 } uae_cpu_host_hooks_t;
 
-/* Opaque CPU Instance Handle */
+/*
+ * Opaque CPU handle. The core is single-instance: CPU state, the memory map,
+ * hooks and the JIT cache are global, so every handle refers to the same CPU
+ * and uae_cpu_create() does not give an independent core. Drive the CPU from
+ * one thread; only the calls marked thread-safe may be made from others.
+ */
 typedef struct uae_cpu_instance uae_cpu_t;
 
 /* Global Init / Cleanup */

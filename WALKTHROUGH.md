@@ -10,7 +10,7 @@
 - **JIT Infrastructure**: JIT compilation engines for both **ARM64** and **x86_64** architectures located in `src/cpu/jit/`.
 - **Dual API Support**:
   1. **Musashi-Compatible C API** (`include/m68k.h` & `src/api/musashi_api.c`): Drop-in replacement for existing Musashi-based emulators (`m68k_init`, `m68k_set_cpu_type`, `m68k_execute`, `m68k_get_reg`, `m68k_set_reg`, etc.).
-  2. **Multi-Instance Context API** (`include/uae_cpu.h` & `src/api/uae_cpu_api.c`): Re-entrant, multi-core/multi-instance CPU context structure modelled after `m68k-rs` (`uae_cpu_create`, `uae_cpu_execute`, `uae_cpu_get_context`, `uae_cpu_set_context`).
+  2. **Context API** (`include/uae_cpu.h` & `src/api/uae_cpu_api.c`): Handle-based CPU API modelled after `m68k-rs` (`uae_cpu_create`, `uae_cpu_execute`, `uae_cpu_get_context`, `uae_cpu_set_context`). The core behind it is single-instance: every handle refers to the same CPU.
 
 ---
 
@@ -40,7 +40,7 @@ All 6 test targets are integrated into CMake and pass via `ctest`:
 
 | Test Target | Suite Description | Tests Passed | Pass Rate | Status |
 | :--- | :--- | :--- | :--- | :--- |
-| **`test_basic`** | Musashi & UAE Multi-instance API smoke tests | All assertions | 100% | **PASSED** |
+| **`test_basic`** | Musashi & UAE context API smoke tests | All assertions | 100% | **PASSED** |
 | **`test_uae_cpu`** | Native UAE Core: 68000–68060 switching, CCR, bitfields, CAS, SoftFloat FPU (`FMUL.D`), context isolation | All assertions | 100% | **PASSED** |
 | **`musashi_68000`** | Musashi 68000 instruction verification test suite | 55 / 60 | 91.7% | **PASSED** |
 | **`musashi_68040`** | Musashi 68040 instruction verification test suite | 16 / 18 | 88.9% | **PASSED** |

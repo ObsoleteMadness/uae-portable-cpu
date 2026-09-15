@@ -18,7 +18,7 @@ All Amiga- and Atari ST-specific hardware dependencies, custom chipset logic, fl
   - Flexible memory callbacks: Host applications supply simple read/write callbacks or directly mapped address spaces.
 - **Dual C APIs**:
   1. **Musashi-Compatible C API (`include/m68k.h`)**: Drop-in replacement for emulators already using Musashi.
-  2. **Multi-Instance Context API (`include/uae_cpu.h`)**: Re-entrant, multi-instance CPU context model inspired by `m68k-rs` for running multiple independent 68k cores concurrently.
+  2. **Context API (`include/uae_cpu.h`)**: Handle-based API modelled on `m68k-rs`, with host hooks, typed memory regions and JIT controls. The core is single-instance: its state is global, so every handle refers to the same CPU (one CPU per process).
 - **Host Hooks**: Emulator-neutral hooks for host-trap opcodes, Line-A/Line-F interception, TRAP #n, exception observation, pulled interrupts, busy-wait loops and instruction-aborting bus errors. See [HOST_HOOKS.md](HOST_HOOKS.md).
 - **Comprehensive Verification**: Validated against the test suites of Musashi, `m68k-rs`, and native UAE CPU tests.
 
@@ -30,11 +30,11 @@ All Amiga- and Atari ST-specific hardware dependencies, custom chipset logic, fl
 uae-portable-cpu/
 ├── include/                  # Public C/C++ API headers
 │   ├── m68k.h                # Musashi-compatible C API
-│   └── uae_cpu.h             # Multi-instance context API & definitions
+│   └── uae_cpu.h             # Context API & definitions
 ├── src/
 │   ├── api/                  # API translation layers
 │   │   ├── musashi_api.c     # Implementation of Musashi API
-│   │   └── uae_cpu_api.c     # Implementation of multi-instance Context API
+│   │   └── uae_cpu_api.c     # Implementation of the Context API
 │   └── cpu/                  # UAE portable CPU core engine
 │       ├── build68k.c        # Opcode table preprocessor generator
 │       ├── gencpu.c          # C opcode generator tool
@@ -199,7 +199,7 @@ int main(void) {
 }
 ```
 
-### 2. Multi-Instance Context API (`uae_cpu.h`)
+### 2. Context API (`uae_cpu.h`)
 
 ```c
 #include "uae_cpu.h"
