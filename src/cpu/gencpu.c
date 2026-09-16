@@ -5823,11 +5823,21 @@ static void gen_opcode (unsigned int opcode)
 		out("uae_u16 newv_lo = (dst & 0xF) - (src & 0xF) - (GET_XFLG() ? 1 : 0);\n");
 		out("uae_u16 newv_hi = (dst & 0xF0) - (src & 0xF0);\n");
 		out("uae_u16 newv, tmp_newv;\n");
-		out("int bcd = 0;\n");
-		out("newv = tmp_newv = newv_hi + newv_lo;\n");
-		out("if (newv_lo & 0xF0) { newv -= 6; bcd = 6; };\n");
-		out("if ((((dst & 0xFF) - (src & 0xFF) - (GET_XFLG() ? 1 : 0)) & 0x100) > 0xFF) { newv -= 0x60; }\n");
-		out("SET_CFLG((((dst & 0xFF) - (src & 0xFF) - bcd - (GET_XFLG() ? 1 : 0)) & 0x300) > 0xFF);\n");
+		out("int cflg;\n");
+		out("tmp_newv = newv_hi + newv_lo;\n");
+		/* The decimal adjust has to happen on the low nibble before the high
+		 * nibble is added, not after: adding first and then subtracting 6
+		 * from the combined value gives a different result whenever the low
+		 * borrow propagates, which is 2025 of the 10000 BCD operand pairs
+		 * with X clear and 1539 with X set. The carry was already computed
+		 * from a separate expression and is unaffected, which is why
+		 * mc68000/sbcd.bin reported the right carry count and wrong sums. */
+		out("newv = newv_lo;\n");
+		out("if (newv_lo > 9) { newv -= 6; }\n");
+		out("newv += newv_hi;\n");
+		out("cflg = newv > 0x99;\n");
+		out("if (cflg) newv += 0xA0;\n");
+		out("SET_CFLG(cflg);\n");
 		duplicate_carry();
 		/* Manual says bits NV are undefined though a real 68030 doesn't change V and 68040/060 don't change both */
 		if (cpu_level >= xBCD_KEEPS_N_FLAG) {
@@ -6042,7 +6052,12 @@ static void gen_opcode (unsigned int opcode)
 		out("int cflg;\n");
 		out("newv = tmp_newv = newv_hi + newv_lo;");
 		out("if (newv_lo > 9) { newv += 6; }\n");
-		out("cflg = (newv & 0x3F0) > 0x90;\n");
+		/* Masking to 0x3F0 keeps bit 9 and drops everything above it, so an
+		 * operand pair whose intermediate sum carries past 0x3FF compares
+		 * wrong: 459 of the 10000 BCD pairs lose their carry (918 of the
+		 * 24480 the mc68000/abcd.bin fixture counts). NBCD's (newv & 0x1F0)
+		 * test is a different expression over negated operands and stays. */
+		out("cflg = newv > 0x99;\n");
 		out("if (cflg) newv += 0x60;\n");
 		out("SET_CFLG(cflg);\n");
 		duplicate_carry();
@@ -8465,7 +8480,7 @@ bccl_not68020:
 		out("SET_ZFLG(1);\n");
 		out("}else{\n");
 		out("if (lower <= upper && (reg < lower || reg > upper)) SET_ALWAYS_CFLG(1);\n");
-		out("if (lower > upper && reg > upper && reg < lower) SET_ALWAYS_CFLG(1);\n");
+		out("if (lower > upper && (reg > upper || reg < lower)) SET_ALWAYS_CFLG(1);\n");
 		out("}\n");
 		out("if ((extra & 0x800) && GET_CFLG()) {\n");
 		exception_cpu("6");
