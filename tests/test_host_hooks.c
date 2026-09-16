@@ -770,8 +770,96 @@ static void test_jit_compiles(void)
     CHECK(uae_cpu_get_jit_code_size(s_cpu) == 0);
 }
 
+/*
+ * A host that writes guest code reports it with uae_cpu_invalidate_code().
+ *
+ * The write lands in the middle of a subroutine the loop has already run often
+ * enough to be translated, which is the case an invalidation that only matched
+ * block start addresses used to miss.
+ */
+static void test_invalidate_code_range(void)
+{
+    /* MOVEQ #0,D0; MOVE.W #999,D1; loop: JSR sub; ADD.L D2,D0; DBRA D1,loop */
+    static const uint16_t code[] = {
+        0x7000, 0x323C, 0x03E7,
+        0x4EB9, 0x0000, 0x5000,
+        0xD082,
+        0x51C9, 0xFFF6,
+        OP_EXEC_RETURN
+    };
+    uae_cpu_host_hooks_t hooks;
+
+    printf("[*] uae_cpu_invalidate_code: a write inside a translated block\n");
+    boot(UAE_CPU_TYPE_68020, code, sizeof(code) / sizeof(code[0]));
+    memset(&hooks, 0, sizeof(hooks));
+    hooks.illegal = on_illegal;
+    uae_cpu_set_host_hooks(s_cpu, &hooks);
+    /* sub: MOVEQ #0,D3; MOVEQ #1,D2; RTS — the patch target is the second
+     * instruction, so the block's start address stays unchanged.
+     * 0x5000: clear of HANDLER_ADDR (0x2000) and NESTED_ADDR (0x3000). */
+    w16(0x5000, 0x7600);
+    w16(0x5002, 0x7401);
+    w16(0x5004, 0x4E75);
+
+    run_until(0x1014);
+    CHECK(reg(UAE_REG_D0) == 1000);
+    if (getenv("UAE_TEST_JIT"))
+        CHECK(uae_cpu_get_jit_code_size(s_cpu) > 0);
+
+    /* MOVEQ #1,D2 becomes MOVEQ #2,D2. */
+    w16(0x5002, 0x7402);
+    uae_cpu_invalidate_code(s_cpu, 0x5002, 2);
+
+    uae_cpu_set_reg(s_cpu, UAE_REG_PC, 0x1000);
+    run_until(0x1014);
+    CHECK(reg(UAE_REG_D0) == 2000);
+}
+
+/*
+ * A guest that writes code announces it by flushing its own instruction cache.
+ *
+ * The 68040 CPUSHA below is the whole notification: the host is never told, so
+ * translations survive it unless the core treats the flush as an invalidation.
+ * Hosts that report every code write themselves can set
+ * jit_ignore_guest_cache_flush.
+ */
+static void test_guest_cache_flush(void)
+{
+    static const uint16_t code[] = {
+        0x7000, 0x323C, 0x03E7,         /* MOVEQ #0,D0; MOVE.W #999,D1       */
+        0x4EB9, 0x0000, 0x5000,         /* loop: JSR sub                     */
+        0xD082,                         /* ADD.L D2,D0                       */
+        0x51C9, 0xFFF6,                 /* DBRA D1,loop                      */
+        0x31FC, 0x7402, 0x5002,         /* MOVE.W #$7402,($2002).W  (patch)  */
+        0xF4B8,                         /* CPUSHA IC                         */
+        0x7000, 0x323C, 0x0009,         /* MOVEQ #0,D0; MOVE.W #9,D1         */
+        0x4EB9, 0x0000, 0x5000,         /* loop2: JSR sub                    */
+        0xD082,                         /* ADD.L D2,D0                       */
+        0x51C9, 0xFFF6,                 /* DBRA D1,loop2                     */
+        OP_EXEC_RETURN
+    };
+    uae_cpu_host_hooks_t hooks;
+
+    printf("[*] guest instruction-cache flush invalidates translations\n");
+    boot(UAE_CPU_TYPE_68040, code, sizeof(code) / sizeof(code[0]));
+    memset(&hooks, 0, sizeof(hooks));
+    hooks.illegal = on_illegal;
+    uae_cpu_set_host_hooks(s_cpu, &hooks);
+    w16(0x5000, 0x7600);                /* MOVEQ #0,D3 */
+    w16(0x5002, 0x7401);                /* MOVEQ #1,D2 */
+    w16(0x5004, 0x4E75);                /* RTS         */
+
+    run_until(0x102E);
+    CHECK(reg(UAE_REG_PC) == 0x102E);
+    CHECK(reg(UAE_REG_D0) == 20);       /* 10 passes of the patched MOVEQ #2 */
+    if (getenv("UAE_TEST_JIT"))
+        CHECK(uae_cpu_get_jit_code_size(s_cpu) > 0);
+}
+
 int main(void)
 {
+    /* Unbuffered: a scenario that faults still leaves its name in the log. */
+    setvbuf(stdout, NULL, _IONBF, 0);
     uae_cpu_global_init();
     s_cpu = uae_cpu_create(NULL);
     if (getenv("UAE_TEST_JIT") && getenv("UAE_TEST_JIT_DIRECT")) {
@@ -801,6 +889,8 @@ int main(void)
     test_fpu_backend();
     test_fpu_loop();
     test_jit_compiles();
+    test_invalidate_code_range();
+    test_guest_cache_flush();
 
     uae_cpu_destroy(s_cpu);
     if (s_failures) {
