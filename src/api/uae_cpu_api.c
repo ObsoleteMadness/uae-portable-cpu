@@ -69,7 +69,8 @@ void uae_cpu_set_config(uae_cpu_t *cpu, const uae_cpu_config_t *config) {
     bool fpu_backend_changed = currprefs.fpu_mode != fpu_mode;
     currprefs.fpu_mode = fpu_mode;
     uae_host_configure_jit(config->jit_enabled, config->jit_cache_size, config->jit_follow_cacr,
-                           config->jit_direct_memory, config->jit_fpu);
+                           config->jit_direct_memory, config->jit_fpu,
+                           !config->jit_ignore_guest_cache_flush);
     g_unmapped_bus_error = config->unmapped_bus_error;
 
     changed_prefs = currprefs;

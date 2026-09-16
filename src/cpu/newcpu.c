@@ -1845,6 +1845,22 @@ void flush_cpu_caches_040(uae_u16 opcode)
 	bool pushinv = (regs.cacr & 0x01000000) == 0; // 68060 DPI
 
 	flush_cpu_caches_040_2(cache, scope, addr, push, pushinv);
+#ifdef JIT
+	/* A guest that writes code announces it by flushing its instruction
+	 * cache. Translations outlive that cache, so treat the flush as an
+	 * invalidation of the same scope unless the host opted out. */
+	if ((cache & 2) && currprefs.cachesize && g_jit_honour_guest_cache_flush) {
+		if (scope == 3) {
+			flush_icache(3);
+		} else {
+			uae_u32 len = scope == 2 ? (mmu_pagesize_8k ? 8192 : 4096) : 16;
+			flush_icache_range(addr & ~(len - 1), len);
+		}
+		/* The flush re-points block chains, so leave compiled code rather
+		 * than run on inside a block whose jumps have just been patched. */
+		set_special(SPCFLAG_END_COMPILE);
+	}
+#endif
 #ifdef WITH_PPC
 	if (cache & 2) {
 		uae_ppc_mark_code_cache_dirty();

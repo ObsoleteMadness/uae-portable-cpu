@@ -124,9 +124,13 @@ extern bool g_jit_follow_cacr;
  * region handler; bus errors cannot be raised from that context. */
 extern bool g_jit_in_fault_recovery;
 
+/* When true, a guest instruction-cache flush (68040+ CINVA/CPUSHA, 68020/030
+ * CACR) also invalidates translations covering the flushed range. */
+extern bool g_jit_honour_guest_cache_flush;
+
 /* Applies the uae_cpu_config_t JIT settings before the CPU tables are rebuilt. */
 void uae_host_configure_jit(bool enabled, uint32_t cache_kb, bool follow_cacr, bool direct_memory,
-                            bool jit_fpu);
+                            bool jit_fpu, bool honour_guest_cache_flush);
 
 /* True when compiled code must call this opcode's C handler (host hooks need it). */
 int uae_host_jit_must_interpret(uint32_t opcode);

@@ -40,6 +40,7 @@ int g_host_fline_consulted = 0;
 bool g_jit_run_active = false;
 bool g_jit_follow_cacr = false;
 bool g_jit_in_fault_recovery = false;
+bool g_jit_honour_guest_cache_flush = true;
 int64_t g_jit_run_target = 0;
 
 #ifdef JIT
@@ -491,9 +492,10 @@ int uae_host_step(void)
  *            profiling saw touch handler-backed memory.
  */
 void uae_host_configure_jit(bool enabled, uint32_t cache_kb, bool follow_cacr, bool direct_memory,
-                            bool jit_fpu)
+                            bool jit_fpu, bool honour_guest_cache_flush)
 {
     g_jit_follow_cacr = follow_cacr;
+    g_jit_honour_guest_cache_flush = honour_guest_cache_flush;
 #ifdef JIT
     int want = 0;
 
