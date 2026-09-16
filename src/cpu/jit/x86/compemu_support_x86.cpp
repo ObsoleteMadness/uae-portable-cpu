@@ -4341,10 +4341,12 @@ void get_n_addr_jmp(int address, int dest, int tmp)
 	get_n_addr(address,dest,tmp);
 #else
 #ifdef UAE
-	if (special_mem || distrust_addr() || jit_use_memory_helpers()) {
-		get_n_addr(address,dest,tmp);
-		return;
-	}
+	/* A jump target becomes the host PC of translated code, and translated
+	 * code only runs inside the flat JIT window (uae_host_jit_pc_translatable).
+	 * Resolving it through a bank's xlateaddr callback, as the distrust path
+	 * did, yields a pointer that is not a window PC. Jump targets therefore
+	 * stay on the window translation below in every trust mode; ordinary data
+	 * accesses still honour the trust settings. */
 #endif
 #if X86_TARGET_64BIT
 	if (canbang && dest == PC_P) {

@@ -2973,11 +2973,16 @@ void get_n_addr(int address, int dest)
 void get_n_addr_jmp(int address, int dest)
 {
     /* For this, we need to get the same address as the rest of UAE
-       would --- otherwise we end up translating everything twice */
-    if (special_mem || distrust_addr() || jit_n_addr_unsafe)
-        get_n_addr_old(address, dest);
-    else
-        jnf_MEM_GETADR_JMP_OFF(dest, address);
+       would --- otherwise we end up translating everything twice.
+     *
+     * Jump targets become the host PC of translated code, and translated code
+     * only ever runs inside the flat JIT window (see
+     * uae_host_jit_pc_translatable). Resolving them through the bank's
+     * xlateaddr callback, as the distrust path did, hands the dispatcher a
+     * pointer that is not a window PC - and faults outright on AArch64 - so
+     * jump targets stay on the window translation in every trust mode. Ordinary
+     * data accesses above still honour the trust settings. */
+    jnf_MEM_GETADR_JMP_OFF(dest, address);
 }
 
 /* base is a register, but dp is an actual value.
