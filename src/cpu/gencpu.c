@@ -8480,7 +8480,7 @@ bccl_not68020:
 		out("SET_ZFLG(1);\n");
 		out("}else{\n");
 		out("if (lower <= upper && (reg < lower || reg > upper)) SET_ALWAYS_CFLG(1);\n");
-		out("if (lower > upper && reg > upper && reg < lower) SET_ALWAYS_CFLG(1);\n");
+		out("if (lower > upper && (reg > upper || reg < lower)) SET_ALWAYS_CFLG(1);\n");
 		out("}\n");
 		out("if ((extra & 0x800) && GET_CFLG()) {\n");
 		exception_cpu("6");
