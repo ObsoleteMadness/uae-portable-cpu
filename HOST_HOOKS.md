@@ -199,7 +199,7 @@ cycle-exact, MMU and test cores always execute the loop literally.
 | `uae_cpu_signal_irq(cpu)` | Re-sample the interrupt level (thread-safe) |
 | `uae_cpu_get_cycles(cpu)` | Monotonic 64-bit CPU cycle count since the core was initialised; usable as an emulated clock |
 | `uae_cpu_raise_bus_error(cpu, addr, is_write, size)` | Abort the current instruction with a bus error. The frame matches the configured CPU. No effect outside execute calls |
-| `uae_cpu_invalidate_code(cpu, addr, size)` | Discard translated code that may overlap the range. Blocks are checksummed before reuse, so any size > 0 is safe. A no-op without a JIT, so hosts can call it unconditionally |
+| `uae_cpu_invalidate_code(cpu, addr, size)` | Discard translated code that may overlap the range. Only overlapping blocks are disturbed, and they are checksummed before reuse, so unchanged code is kept and any size > 0 is safe; `UINT32_MAX` discards everything for a write that cannot be bounded. A no-op without a JIT, so hosts can call it unconditionally |
 | `uae_cpu_set_jit_memory_base(cpu, base)` | Declare the flat guest window (`host = base + guest`) the JIT translates code from |
 | `uae_cpu_get_jit_code_size(cpu)` | Bytes of translated host code in the cache (0 without a JIT) |
 | `uae_cpu_get_mem_flags(cpu, addr)` | `uae_mem_flags_t` bits of the region containing `addr`; 0 when unmapped |

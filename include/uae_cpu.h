@@ -111,6 +111,12 @@ typedef struct {
     bool jit_direct_memory;  /* true = translated code reads and writes UAE_MEM_JIT_DIRECT regions
                               * inline through the JIT memory base instead of calling the region
                               * handlers; see uae_cpu_set_jit_memory_base() */
+    bool jit_ignore_guest_cache_flush;
+                             /* true = ignore the guest's own instruction-cache flushes
+                              * (68040+ CINVA/CPUSHA, 68020/030 CACR). Leave it false when guest
+                              * code writes code and announces it that way; set it when the host
+                              * reports every code write through uae_cpu_invalidate_code() and
+                              * the guest flushes often enough for it to cost */
     bool jit_fpu;            /* true = also translate FPU instructions (WinUAE "JIT FPU"). Takes
                               * effect only with jit_enabled, jit_direct_memory, an FPU and
                               * fpu_softfloat = false: translated FPU code works on host doubles

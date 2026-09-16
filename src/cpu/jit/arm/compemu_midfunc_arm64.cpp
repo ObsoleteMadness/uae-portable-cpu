@@ -715,6 +715,23 @@ STATIC_INLINE void flush_cpu_icache(void *start, void *stop)
   }
 #endif
 
+#if defined(CPU_AARCH64)
+	/* A thread inside a write window cannot execute translated code, so the
+	 * ranges can be collected and invalidated once when the window closes.
+	 * compile_block() patches every branch it emits, and one
+	 * sys_icache_invalidate() per patch was 61% of emulation-thread time on
+	 * Apple Silicon. */
+	if (jit_write_window_depth > 0) {
+		jit_icache_defer(start, stop);
+		return;
+	}
+#endif
+	jit_icache_flush_now(start, stop);
+}
+
+/* Makes [start, stop) visible to instruction fetch on this host. */
+STATIC_INLINE void jit_icache_flush_now(void *start, void *stop)
+{
 #if defined(_WIN32) && defined(CPU_AARCH64)
 	FlushInstructionCache(GetCurrentProcess(), start, (SIZE_T)((char *)stop - (char *)start));
 #elif defined(__APPLE__) && defined(CPU_AARCH64)
