@@ -757,8 +757,47 @@ STATIC_INLINE void flush_cpu_icache(void *from, void *to);
 STATIC_INLINE void jit_begin_write_window(void);
 STATIC_INLINE void jit_end_write_window(void);
 STATIC_INLINE void write_jmp_target(uae_u32 *jmpaddr, uintptr a);
+STATIC_INLINE void jit_icache_flush_now(void *start, void *stop);
 
 static int jit_write_window_depth = 0;
+
+#if defined(CPU_AARCH64)
+/* Ranges written while a window is open, invalidated together at its close.
+ * Nearby ranges merge, so patching one block costs one invalidation rather
+ * than one per branch. A full list flushes early instead of growing. */
+enum { JIT_ICACHE_PENDING_MAX = 32, JIT_ICACHE_MERGE_GAP = 4096 };
+static struct { char *lo, *hi; } jit_icache_pending[JIT_ICACHE_PENDING_MAX];
+static int jit_icache_pending_count = 0;
+
+static void jit_icache_flush_pending(void)
+{
+	for (int i = 0; i < jit_icache_pending_count; i++)
+		jit_icache_flush_now(jit_icache_pending[i].lo, jit_icache_pending[i].hi);
+	jit_icache_pending_count = 0;
+}
+
+static void jit_icache_defer(void *start, void *stop)
+{
+	char *lo = (char *)start;
+	char *hi = (char *)stop;
+
+	for (int i = 0; i < jit_icache_pending_count; i++) {
+		if (lo <= jit_icache_pending[i].hi + JIT_ICACHE_MERGE_GAP &&
+		    hi + JIT_ICACHE_MERGE_GAP >= jit_icache_pending[i].lo) {
+			if (lo < jit_icache_pending[i].lo)
+				jit_icache_pending[i].lo = lo;
+			if (hi > jit_icache_pending[i].hi)
+				jit_icache_pending[i].hi = hi;
+			return;
+		}
+	}
+	if (jit_icache_pending_count == JIT_ICACHE_PENDING_MAX)
+		jit_icache_flush_pending();
+	jit_icache_pending[jit_icache_pending_count].lo = lo;
+	jit_icache_pending[jit_icache_pending_count].hi = hi;
+	jit_icache_pending_count++;
+}
+#endif
 
 STATIC_INLINE void jit_begin_write_window(void)
 {
@@ -778,10 +817,15 @@ STATIC_INLINE void jit_end_write_window(void)
 		return;
 	}
 	jit_write_window_depth--;
+	if (jit_write_window_depth > 0)
+		return;
+#if defined(CPU_AARCH64)
+	/* Before execute is allowed again, and before anything can fetch from
+	 * the pages written inside the window. */
+	jit_icache_flush_pending();
+#endif
 #if defined(__APPLE__) && defined(CPU_AARCH64)
-	if (jit_write_window_depth == 0) {
-		uae_vm_jit_write_protect(true);
-	}
+	uae_vm_jit_write_protect(true);
 #endif
 }
 
