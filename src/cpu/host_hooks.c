@@ -25,6 +25,9 @@
 #include "cpu_prefetch.h"
 #include "readcpu.h"
 #include "mmu_common.h"
+#ifdef JIT
+#include "jit/compemu.h"   /* flush_icache_range() */
+#endif
 #include "host_hooks.h"
 
 #include <limits.h>
@@ -600,18 +603,25 @@ void uae_host_jit_do_cycles(int cycles)
  * current block.
  *
  * Arguments:
- *   addr: Start of the modified range (unused: flushes are cache-wide).
- *   size: Length of the modified range; 0 is a no-op.
+ *   addr: Start of the modified range.
+ *   size: Length of the modified range; 0 is a no-op, UINT32_MAX means "all
+ *         translated code" for hosts that cannot bound the write.
  */
 void uae_host_invalidate_code(uint32_t addr, uint32_t size)
 {
-    (void)addr;
 #ifdef JIT
     if (size == 0 || !currprefs.cachesize || !flush_icache)
         return;
-    flush_icache(3);
+    /* A bounded range disturbs only the blocks that overlap it: they are
+     * checksummed on their next entry and recompiled only if they really
+     * changed, leaving the rest of the cache in place. */
+    if (size == UINT32_MAX)
+        flush_icache(3);
+    else
+        flush_icache_range(addr, size);
     set_special(SPCFLAG_END_COMPILE);
 #else
+    (void)addr;
     (void)size;
 #endif
 }

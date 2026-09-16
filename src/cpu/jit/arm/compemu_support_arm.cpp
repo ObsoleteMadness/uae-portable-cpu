@@ -3917,6 +3917,55 @@ static inline void flush_icache_lazy(int v)
     active = NULL;
 }
 
+/*
+ * Invalidates the translations whose source overlaps [addr, addr + length).
+ *
+ * Overlap is tested against every checksum range of a block, not just its
+ * start, so a write into the middle of a block is caught. Matching blocks are
+ * sent to check_checksum on their next entry: unchanged code is reactivated,
+ * changed code is recompiled, and the rest of the cache is left alone. Safe to
+ * call from a host call made by compiled code, since no emitted code is
+ * discarded, only redirected.
+ */
+void flush_icache_range(uaecptr addr, uae_u32 length)
+{
+    if (!active || length == 0)
+        return;
+
+    uae_u8* start_p = get_real_address(addr);
+    blockinfo* bi = active;
+    while (bi) {
+        bool overlaps = false;
+        for (checksum_info* csi = bi->csi; csi && !overlaps; csi = csi->next)
+            overlaps = ((uintptr)start_p - (uintptr)csi->start_p) < csi->length ||
+                       ((uintptr)csi->start_p - (uintptr)start_p) < length;
+        if (!bi->csi)
+            overlaps = ((uintptr)bi->pc_p - (uintptr)start_p) < length;
+
+        blockinfo* dbi = bi;
+        bi = bi->next;
+        if (!overlaps)
+            continue;
+
+        uae_u32 cl = cacheline(dbi->pc_p);
+        if (dbi->status == BI_INVALID || dbi->status == BI_NEED_RECOMP) {
+            if (dbi == cache_tags[cl + 1].bi)
+                cache_tags[cl].handler = (cpuop_func*)popall_execute_normal;
+            dbi->handler_to_use = (cpuop_func*)popall_execute_normal;
+            set_dhtu(dbi, dbi->direct_pen);
+            dbi->status = BI_INVALID;
+        } else {
+            if (dbi == cache_tags[cl + 1].bi)
+                cache_tags[cl].handler = (cpuop_func*)popall_check_checksum;
+            dbi->handler_to_use = (cpuop_func*)popall_check_checksum;
+            set_dhtu(dbi, dbi->direct_pcc);
+            dbi->status = BI_NEED_CHECK;
+        }
+        remove_from_list(dbi);
+        add_to_dormant(dbi);
+    }
+}
+
 int failure;
 
 static inline unsigned int get_opcode_cft_map(unsigned int f)

@@ -182,6 +182,8 @@ extern int get_cache_state(void);
 extern uae_u32 get_jitted_size(void);
 #ifdef JIT
 extern void (*flush_icache)(int);
+/* Invalidate only the translations whose source overlaps [addr, addr+length). */
+extern void flush_icache_range(uaecptr addr, uae_u32 length);
 #endif
 extern void alloc_cache(void);
 extern int check_for_cache_miss(void);
