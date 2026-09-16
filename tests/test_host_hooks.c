@@ -856,6 +856,102 @@ static void test_guest_cache_flush(void)
         CHECK(uae_cpu_get_jit_code_size(s_cpu) > 0);
 }
 
+/* Writes a big-endian word into a host buffer that is not the JIT window. */
+static void poke16(uint8_t *p, uint32_t off, uint16_t v)
+{
+    p[off] = (uint8_t)(v >> 8);
+    p[off + 1] = (uint8_t)v;
+}
+
+/*
+ * Every jump form, including calls that cross the JIT window boundary.
+ *
+ * A jump target becomes regs.pc_p, and the 68k PC is recovered from it
+ * relative to regs.pc_oldp (m68k_getpc). That arithmetic is only meaningful
+ * for a pointer inside the flat JIT window, so jump targets are always
+ * window pointers; a target whose bank lives elsewhere is caught by
+ * uae_host_jit_pc_translatable() and interpreted a block at a time.
+ *
+ * The call to the region at 0x200000 is the interesting one: its host buffer
+ * is a plain array, so the bank's own pointer is nowhere near the window.
+ * Resolving the target through the bank instead would hand the dispatcher a
+ * pointer it cannot turn back into a 68k PC.
+ */
+static void test_jump_targets(void)
+{
+    static const uint16_t code[] = {
+        0x7000,                         /* MOVEQ #0,D0                       */
+        0x323C, 0x0063,                 /* MOVE.W #99,D1                     */
+        0x4EB9, 0x0000, 0x5000,         /* loop: JSR ($5000).L        +1     */
+        0x6100, 0x3FF2,                 /* BSR.W $5000                +1     */
+        0x41F9, 0x0000, 0x5000,         /* LEA ($5000).L,A0                  */
+        0x4E90,                         /* JSR (A0)                   +1     */
+        0x4EB9, 0x0020, 0x0000,         /* JSR ($200000).L            +2     */
+        0x4EB9, 0x0000, 0x6000,         /* JSR ($6000).L              +3     */
+        0x51C9, 0xFFE0,                 /* DBRA D1,loop                      */
+        OP_EXEC_RETURN
+    };
+    static uint8_t outside[0x10000];
+    uae_cpu_host_hooks_t hooks;
+
+    printf("[*] jump targets: every form, including across the JIT window\n");
+    boot(UAE_CPU_TYPE_68020, code, sizeof(code) / sizeof(code[0]));
+    memset(&hooks, 0, sizeof(hooks));
+    hooks.illegal = on_illegal;
+    uae_cpu_set_host_hooks(s_cpu, &hooks);
+
+    /* In the window: ADDQ.L #1,D0; RTS */
+    w16(0x5000, 0x5280);
+    w16(0x5002, 0x4E75);
+    /* In the window, and calls out of it: ADDQ.L #1,D0; JSR ($200000).L; RTS */
+    w16(0x6000, 0x5280);
+    w16(0x6002, 0x4EB9);
+    w16(0x6004, 0x0020);
+    w16(0x6006, 0x0000);
+    w16(0x6008, 0x4E75);
+    /* Outside the window: ADDQ.L #2,D0; RTS */
+    memset(outside, 0, sizeof(outside));
+    poke16(outside, 0, 0x5480);
+    poke16(outside, 2, 0x4E75);
+    uae_cpu_map_memory(s_cpu, 0x200000, sizeof(outside), outside,
+                       UAE_MEM_RAM | UAE_MEM_CACHEABLE | UAE_MEM_JIT_DIRECT);
+
+    run_until(0x102A);
+    CHECK(reg(UAE_REG_PC) == 0x102A);
+    CHECK(reg(UAE_REG_D0) == 800);      /* 100 passes x (1 + 1 + 1 + 2 + 3) */
+    CHECK(reg(UAE_REG_A0) == 0x5000);
+    if (getenv("UAE_TEST_JIT"))
+        CHECK(uae_cpu_get_jit_code_size(s_cpu) > 0);
+    uae_cpu_unmap_memory(s_cpu, 0x200000, sizeof(outside));
+}
+
+/*
+ * A call into unmapped memory raises a bus error instead of following a
+ * pointer nowhere. Under jit_direct_memory the window address for an
+ * unmapped bank is reserved but unreadable, so anything that dereferenced
+ * the target before deciding it was untranslatable would fault here.
+ */
+static void test_jump_unmapped(void)
+{
+    static const uint16_t code[] = {
+        0x7000,                         /* MOVEQ #0,D0        */
+        0x4EB9, 0x0080, 0x0000,         /* JSR ($800000).L    */
+        OP_EXEC_RETURN
+    };
+    uae_cpu_host_hooks_t hooks;
+
+    printf("[*] a call into unmapped memory raises a bus error\n");
+    boot(UAE_CPU_TYPE_68020, code, sizeof(code) / sizeof(code[0]));
+    memset(&hooks, 0, sizeof(hooks));
+    hooks.illegal = on_illegal;
+    hooks.exception = on_exception;
+    uae_cpu_set_host_hooks(s_cpu, &hooks);
+
+    uae_cpu_execute(s_cpu, 100000);
+    CHECK(R.exceptions[2] == 1);
+    CHECK(reg(UAE_REG_PC) == HANDLER_ADDR + 2);
+}
+
 int main(void)
 {
     /* Unbuffered: a scenario that faults still leaves its name in the log. */
@@ -891,6 +987,8 @@ int main(void)
     test_jit_compiles();
     test_invalidate_code_range();
     test_guest_cache_flush();
+    test_jump_targets();
+    test_jump_unmapped();
 
     uae_cpu_destroy(s_cpu);
     if (s_failures) {
