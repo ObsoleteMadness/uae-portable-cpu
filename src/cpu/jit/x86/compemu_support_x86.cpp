@@ -4341,10 +4341,12 @@ void get_n_addr_jmp(int address, int dest, int tmp)
 	get_n_addr(address,dest,tmp);
 #else
 #ifdef UAE
-	if (special_mem || distrust_addr() || jit_use_memory_helpers()) {
-		get_n_addr(address,dest,tmp);
-		return;
-	}
+	/* A jump target becomes the host PC of translated code, and translated
+	 * code only runs inside the flat JIT window (uae_host_jit_pc_translatable).
+	 * Resolving it through a bank's xlateaddr callback, as the distrust path
+	 * did, yields a pointer that is not a window PC. Jump targets therefore
+	 * stay on the window translation below in every trust mode; ordinary data
+	 * accesses still honour the trust settings. */
 #endif
 #if X86_TARGET_64BIT
 	if (canbang && dest == PC_P) {
@@ -5533,6 +5535,55 @@ static void flush_icache_range(uae_u32 start, uae_u32 length)
 }
 #endif
 
+
+/*
+ * Invalidates the translations whose source overlaps [addr, addr + length).
+ *
+ * Overlap is tested against every checksum range of a block, not just its
+ * start, so a write into the middle of a block is caught. Matching blocks are
+ * sent to check_checksum on their next entry: unchanged code is reactivated,
+ * changed code is recompiled, and the rest of the cache is left alone. Safe to
+ * call from a host call made by compiled code, since no emitted code is
+ * discarded, only redirected.
+ */
+void flush_icache_range(uaecptr addr, uae_u32 length)
+{
+	if (!active || length == 0)
+		return;
+
+	uae_u8 *start_p = get_real_address(addr);
+	blockinfo *bi = active;
+	while (bi) {
+		bool overlaps = false;
+		for (checksum_info *csi = bi->csi; csi && !overlaps; csi = csi->next)
+			overlaps = ((uintptr)start_p - (uintptr)csi->start_p) < csi->length ||
+					   ((uintptr)csi->start_p - (uintptr)start_p) < length;
+		if (!bi->csi)
+			overlaps = ((uintptr)bi->pc_p - (uintptr)start_p) < length;
+
+		blockinfo *dbi = bi;
+		bi = bi->next;
+		if (!overlaps)
+			continue;
+
+		uae_u32 cl = cacheline(dbi->pc_p);
+		if (dbi->status == BI_INVALID || dbi->status == BI_NEED_RECOMP) {
+			if (dbi == cache_tags[cl + 1].bi)
+				cache_tags[cl].handler = (cpuop_func *)popall_execute_normal;
+			dbi->handler_to_use = (cpuop_func *)popall_execute_normal;
+			set_dhtu(dbi, dbi->direct_pen);
+			dbi->status = BI_INVALID;
+		} else {
+			if (dbi == cache_tags[cl + 1].bi)
+				cache_tags[cl].handler = (cpuop_func *)popall_check_checksum;
+			dbi->handler_to_use = (cpuop_func *)popall_check_checksum;
+			set_dhtu(dbi, dbi->direct_pcc);
+			dbi->status = BI_NEED_CHECK;
+		}
+		remove_from_list(dbi);
+		add_to_dormant(dbi);
+	}
+}
 
 int failure;
 

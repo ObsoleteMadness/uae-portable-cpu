@@ -134,6 +134,8 @@ extern void build_comp(void);
 extern void set_cache_state(int enabled);
 #ifdef JIT
 extern void (*flush_icache)(int);
+/* Invalidate only the translations whose source overlaps [addr, addr+length). */
+extern void flush_icache_range(uaecptr addr, uae_u32 length);
 #endif
 extern void alloc_cache(void);
 extern void compile_block(cpu_history* pc_hist, int blocklen, int totcyles);
