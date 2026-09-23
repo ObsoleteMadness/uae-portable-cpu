@@ -690,6 +690,79 @@ static void test_rom_writes_dropped(void)
 }
 
 /*
+ * Writes one big-endian word into the ROM from map_test_rom(), as a host
+ * patching ROM does, lifting the host write protection around the store.
+ */
+static void rom_poke16(uint8_t *rom, uint32_t off, uint16_t v)
+{
+#if defined(_WIN32)
+    DWORD old;
+    if (s_jit_direct)
+        VirtualProtect(rom, ROM_SIZE, PAGE_READWRITE, &old);
+#else
+    if (s_jit_direct)
+        mprotect(rom, ROM_SIZE, PROT_READ | PROT_WRITE);
+#endif
+    rom[off] = (uint8_t)(v >> 8);
+    rom[off + 1] = (uint8_t)v;
+#if defined(_WIN32)
+    if (s_jit_direct)
+        VirtualProtect(rom, ROM_SIZE, PAGE_READONLY, &old);
+#else
+    if (s_jit_direct)
+        mprotect(rom, ROM_SIZE, PROT_READ);
+#endif
+}
+
+/*
+ * Translated ROM code is not checksummed, since the guest cannot change it,
+ * but the host can: a host that patches ROM code and reports the range through
+ * uae_cpu_invalidate_code() must still see the new code run. Under
+ * jit_direct_memory the ROM sits in the JIT window and its subroutine is
+ * translated; elsewhere it runs on the interpreter and the check is trivial.
+ */
+static void test_invalidate_rom_code(void)
+{
+    /* MOVEQ #0,D0; MOVE.W #999,D1; loop: JSR $300000; ADD.L D2,D0; DBRA D1,loop */
+    static const uint16_t code[] = {
+        0x7000, 0x323C, 0x03E7,
+        0x4EB9, 0x0030, 0x0000,
+        0xD082,
+        0x51C9, 0xFFF6,
+        OP_EXEC_RETURN
+    };
+    uae_cpu_host_hooks_t hooks;
+    uint8_t *rom;
+
+    printf("[*] uae_cpu_invalidate_code: a host patch to translated ROM code\n");
+    boot(UAE_CPU_TYPE_68020, code, sizeof(code) / sizeof(code[0]));
+    memset(&hooks, 0, sizeof(hooks));
+    hooks.illegal = on_illegal;
+    uae_cpu_set_host_hooks(s_cpu, &hooks);
+    rom = map_test_rom();
+    CHECK(rom != NULL);
+    if (!rom)
+        return;
+    /* sub: MOVEQ #0,D3; MOVEQ #1,D2; RTS - patched in the middle, as before. */
+    rom_poke16(rom, 0, 0x7600);
+    rom_poke16(rom, 2, 0x7401);
+    rom_poke16(rom, 4, 0x4E75);
+    uae_cpu_invalidate_code(s_cpu, ROM_ADDR, 6);
+
+    run_until(0x1014);
+    CHECK(reg(UAE_REG_D0) == 1000);
+
+    /* MOVEQ #1,D2 becomes MOVEQ #2,D2. */
+    rom_poke16(rom, 2, 0x7402);
+    uae_cpu_invalidate_code(s_cpu, ROM_ADDR + 2, 2);
+
+    uae_cpu_set_reg(s_cpu, UAE_REG_PC, 0x1000);
+    run_until(0x1014);
+    CHECK(reg(UAE_REG_D0) == 2000);
+    unmap_test_rom(rom);
+}
+
+/*
  * Direct JIT access goes to base + address for whatever address a translated
  * instruction computes, so the direct-mode run reserves the whole 4 GB guest
  * space without access and commits only the RAM at guest 0.
@@ -1081,6 +1154,7 @@ int main(void)
     test_fpu_loop();
     test_jit_compiles();
     test_invalidate_code_range();
+    test_invalidate_rom_code();
     test_guest_cache_flush();
     test_jump_targets();
     test_jump_unmapped();
