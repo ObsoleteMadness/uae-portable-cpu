@@ -823,9 +823,9 @@ static void test_fpu_backend(void)
  * FPU loop checked against C doubles (every value is exact in a double, so
  * all backends must agree to the bit): FADD / FMUL / FCMP / FBcc / FSUB,
  * FMOVE between registers, to memory and to integers. Runs on host doubles;
- * under UAE_TEST_JIT it runs with and without jit_fpu. With
- * jit_direct_memory the translated code must differ in size, which shows the
- * FPU instructions were compiled; without it jit_fpu must have no effect.
+ * under UAE_TEST_JIT it runs with and without jit_fpu, and with jit_fpu the
+ * translated code must differ in size, which shows the FPU instructions were
+ * compiled - with or without jit_direct_memory.
  * The reference values are doubles held across the execute calls, so on
  * AArch64 they also catch translated code clobbering the host's callee-saved
  * d8-d15.
@@ -888,17 +888,123 @@ static void test_fpu_loop(void)
     without_jit_fpu = run_fpu_loop(false);
     if (!getenv("UAE_TEST_JIT"))
         return;
-    if (s_jit_direct)
-        printf("[*] jit_fpu: the same loop with FPU instructions translated\n");
-    else
-        printf("[*] jit_fpu without jit_direct_memory changes nothing\n");
+    printf("[*] jit_fpu: the same loop with FPU instructions translated\n");
     with_jit_fpu = run_fpu_loop(true);
     CHECK(without_jit_fpu > 0);
     CHECK(with_jit_fpu > 0);
-    if (s_jit_direct)
-        CHECK(with_jit_fpu != without_jit_fpu);
-    else
-        CHECK(with_jit_fpu == without_jit_fpu);
+    CHECK(with_jit_fpu != without_jit_fpu);
+}
+
+#define FPU_MEM_COUNT 0x400
+
+/*
+ * Source doubles for run_fpu_memory(): normal values of both signs and
+ * magnitudes, plus +0 and -0. (Denormals, infinities and NaNs are left out:
+ * translated code converts through host doubles and does not reproduce the
+ * 68881's encodings of those.)
+ */
+static double fpu_mem_value(uint32_t n)
+{
+    if (n == 0)
+        return 0.0;
+    if (n == 1)
+        return -0.0;
+    double v = (double)n * 0.75 - 300.5;
+    if (n % 7 == 0)
+        v *= 1.0e200;
+    if (n % 11 == 0)
+        v /= 1.0e250;
+    return v;
+}
+
+/* Writes the 68881 extended encoding of normal or zero v, big-endian, to p. */
+static void fpu_mem_exten(double v, uint8_t *p)
+{
+    uint64_t bits, mant = 0;
+    uint32_t se;
+
+    memcpy(&bits, &v, sizeof(bits));
+    se = (uint32_t)(bits >> 63) << 31;
+    if (bits << 1) {
+        se |= (uint32_t)(((bits >> 52) & 0x7ff) + 15360) << 16;
+        mant = (bits << 11) | (1ULL << 63);
+    }
+    for (int b = 0; b < 4; b++)
+        p[b] = (uint8_t)(se >> (24 - 8 * b));
+    for (int b = 0; b < 8; b++)
+        p[4 + b] = (uint8_t)(mant >> (56 - 8 * b));
+}
+
+/*
+ * Double and extended operands in memory: FMOVE.D loads and stores,
+ * FMOVE.X stores and a (d16,An) load, and FMOVEM.X in both directions. Under
+ * the JIT these are the transfers whose code depends on jit_direct_memory:
+ * inline through the JIT memory base with it, assembled from 32-bit handler
+ * accesses without it. The results are checked bit for bit, including the
+ * zero pad word of the extended format.
+ *
+ * Returns:
+ *   Bytes of translated code afterwards.
+ */
+static uint32_t run_fpu_memory(bool jit_fpu)
+{
+    static const uint16_t code[] = {
+        0x41F9, 0x0008, 0x0000,         /* 1000 LEA $80000,A0  source doubles     */
+        0x43F9, 0x0008, 0x8000,         /* 1006 LEA $88000,A1  extended out       */
+        0x45F9, 0x0009, 0x0000,         /* 100C LEA $90000,A2  FMOVEM stack       */
+        0x47F9, 0x0009, 0x8000,         /* 1012 LEA $98000,A3  doubles out        */
+        0x363C, FPU_MEM_COUNT - 1,      /* 1018 MOVE.W #count-1,D3                */
+        0xF218, 0x5400,                 /* 101C loop: FMOVE.D (A0)+,FP0           */
+        0xF219, 0x6800,                 /* 1020 FMOVE.X FP0,(A1)+                 */
+        0xF229, 0x4880, 0xFFF4,         /* 1024 FMOVE.X (-12,A1),FP1              */
+        0xF222, 0xE003,                 /* 102A FMOVEM.X FP0-FP1,-(A2)            */
+        0xF21A, 0xD030,                 /* 102E FMOVEM.X (A2)+,FP2-FP3            */
+        0xF21B, 0x7500,                 /* 1032 FMOVE.D FP2,(A3)+                 */
+        0xF21B, 0x7580,                 /* 1036 FMOVE.D FP3,(A3)+                 */
+        0x51CB, 0xFFE0,                 /* 103A DBRA D3,loop                      */
+        OP_EXEC_RETURN                  /* 103E                                   */
+    };
+    static uint8_t want_ext[FPU_MEM_COUNT * 12];
+    static uint8_t want_dbl[FPU_MEM_COUNT * 16];
+
+    s_fpu_type = UAE_FPU_68040;
+    s_fpu_native = true;
+    s_jit_fpu = jit_fpu;
+    boot(UAE_CPU_TYPE_68040, code, sizeof(code) / sizeof(code[0]));
+    for (uint32_t n = 0; n < FPU_MEM_COUNT; n++) {
+        double v = fpu_mem_value(n);
+        uint64_t bits;
+        memcpy(&bits, &v, sizeof(bits));
+        for (int b = 0; b < 8; b++) {
+            uint8_t byte = (uint8_t)(bits >> (56 - 8 * b));
+            s_ram[0x80000 + n * 8 + b] = byte;
+            want_dbl[n * 16 + b] = byte;
+            want_dbl[n * 16 + 8 + b] = byte;
+        }
+        fpu_mem_exten(v, want_ext + n * 12);
+    }
+    run_until(0x1040);
+    CHECK(reg(UAE_REG_PC) == 0x1040);
+    CHECK(reg(UAE_REG_A2) == 0x90000);
+    CHECK(memcmp(s_ram + 0x88000, want_ext, sizeof(want_ext)) == 0);
+    CHECK(memcmp(s_ram + 0x98000, want_dbl, sizeof(want_dbl)) == 0);
+    s_jit_fpu = false;
+    s_fpu_native = false;
+    s_fpu_type = UAE_FPU_NONE;
+    return uae_cpu_get_jit_code_size(s_cpu);
+}
+
+static void test_fpu_memory(void)
+{
+    uint32_t without_jit_fpu, with_jit_fpu;
+
+    printf("[*] FPU double/extended memory operands and FMOVEM\n");
+    without_jit_fpu = run_fpu_memory(false);
+    if (!getenv("UAE_TEST_JIT"))
+        return;
+    printf("[*] the same with FPU instructions translated\n");
+    with_jit_fpu = run_fpu_memory(true);
+    CHECK(with_jit_fpu != without_jit_fpu);
 }
 
 static void test_jit_compiles(void)
@@ -1197,6 +1303,7 @@ int main(void)
     test_rom_writes_dropped();
     test_fpu_backend();
     test_fpu_loop();
+    test_fpu_memory();
     test_jit_compiles();
     test_invalidate_code_range();
     test_invalidate_rom_code();

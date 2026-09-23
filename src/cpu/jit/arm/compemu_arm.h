@@ -303,6 +303,7 @@ extern uae_u32 m68k_pc_offset;
 extern void readbyte(int address, int dest);
 extern void readword(int address, int dest);
 extern void readlong(int address, int dest);
+extern bool jit_fpu_inline_mem(bool write);
 extern void writebyte(int address, int source);
 extern void writeword(int address, int source);
 extern void writelong(int address, int source);

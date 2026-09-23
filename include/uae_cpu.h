@@ -118,9 +118,10 @@ typedef struct {
                               * reports every code write through uae_cpu_invalidate_code() and
                               * the guest flushes often enough for it to cost */
     bool jit_fpu;            /* true = also translate FPU instructions (WinUAE "JIT FPU"). Takes
-                              * effect only with jit_enabled, jit_direct_memory, an FPU and
-                              * fpu_softfloat = false: translated FPU code works on host doubles
-                              * and moves values through the JIT memory base */
+                              * effect only with jit_enabled, an FPU and fpu_softfloat = false:
+                              * translated FPU code works on host doubles. Works with or without
+                              * jit_direct_memory; memory operands follow the same inline or
+                              * handler choice as integer accesses */
 } uae_cpu_config_t;
 
 /* Memory Read/Write Callbacks for custom mapped devices */

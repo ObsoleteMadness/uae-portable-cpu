@@ -1227,6 +1227,27 @@ MIDFUNC(2,fp_to_exten_rm,(FW d, RR4 adr))
 }
 MENDFUNC(2,fp_to_exten_rm,(FW d, RR4 adr))
 
+/* Extended <-> host buffer of three host-order words; see raw_fp_to_exten_host(). */
+MIDFUNC(2,fp_from_exten_host,(MEMW m, FR s))
+{
+	clobber_flags();
+
+	s = f_readreg(s);
+	raw_fp_from_exten_host(m, s);
+	f_unlock(s);
+}
+MENDFUNC(2,fp_from_exten_host,(MEMW m, FR s))
+
+MIDFUNC(2,fp_to_exten_host,(FW d, MEMR m))
+{
+	clobber_flags();
+
+	d = f_writereg(d);
+	raw_fp_to_exten_host(d, m);
+	f_unlock(d);
+}
+MENDFUNC(2,fp_to_exten_host,(FW d, MEMR m))
+
 MIDFUNC(2,fp_from_double_mr,(RR4 adr, FR s))
 {
 	adr = readreg(adr);

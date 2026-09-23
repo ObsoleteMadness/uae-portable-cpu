@@ -1126,11 +1126,9 @@ void comp_fpp_opp(uae_u32 opcode, uae_u16 extra)
 	int reg;
 	int src;
 
-	if (special_mem)
-	{
-		FAIL(1);
-		return;
-	}
+	/* Operands in memory go through readlong()/writelong() and temp_fp,
+	 * which use the memory handlers where profiling or the trust settings
+	 * require them, so handler-backed memory needs no special case. */
 	if (!currprefs.compfpu)
 	{
 		FAIL(1);

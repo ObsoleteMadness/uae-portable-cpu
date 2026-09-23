@@ -3325,6 +3325,30 @@ void readword(int address, int dest)
         readmem_real(address, dest, 2);
 }
 
+/*
+ * Tells the FPU compiler whether the instruction being compiled may reach
+ * memory inline through the JIT memory base.
+ *
+ * Integer accesses make this choice inside readlong()/writelong(). The FPU's
+ * double and extended transfers have inline-only code generators
+ * (raw_fp_to_double_rm and friends), so compemu_fpp_arm.cpp asks first and
+ * otherwise composes the transfer from readlong()/writelong(), which also
+ * works with the memory handlers (jit_direct_memory off).
+ *
+ * Arguments:
+ *   write: True for a store, false for a load.
+ *
+ * Returns:
+ *   True when direct access is on and profiling saw this instruction touch
+ *   only memory that may be accessed inline.
+ */
+bool jit_fpu_inline_mem(bool write)
+{
+    if (!canbang || jit_n_addr_unsafe || distrust_long())
+        return false;
+    return (special_mem & (write ? S_WRITE : S_READ)) == 0;
+}
+
 void readlong(int address, int dest)
 {
     if ((special_mem & S_READ) || distrust_long() || jit_n_addr_unsafe)

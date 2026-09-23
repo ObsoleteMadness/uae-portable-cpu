@@ -108,4 +108,6 @@ DECLARE_MIDFUNC(fp_from_exten_mr(RR4 adr, FR s));
 DECLARE_MIDFUNC(fp_to_exten_rm(FW d, RR4 adr));
 DECLARE_MIDFUNC(fp_from_double_mr(RR4 adr, FR s));
 DECLARE_MIDFUNC(fp_to_double_rm(FW d, RR4 adr));
+DECLARE_MIDFUNC(fp_from_exten_host(MEMW m, FR s));
+DECLARE_MIDFUNC(fp_to_exten_host(FW d, MEMR m));
 DECLARE_MIDFUNC(fp_fscc_ri(RW4, int cc));

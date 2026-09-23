@@ -484,12 +484,13 @@ int uae_host_step(void)
  *   follow_cacr: uae_cpu_config_t.jit_follow_cacr.
  *   direct_memory: uae_cpu_config_t.jit_direct_memory.
  *   jit_fpu: uae_cpu_config_t.jit_fpu. FPU instructions are translated only
- *            with an FPU, the host-double backend (currprefs.fpu_mode 0, set
- *            by the caller first) and direct_memory: compiled FPU code works
- *            on regs.fp[].fp, which SoftFloat does not use, and moves
- *            extended/double values through the JIT memory base, as in
- *            WinUAE. Both backends refuse to compile FPU instructions that
- *            profiling saw touch handler-backed memory.
+ *            with an FPU and the host-double backend (currprefs.fpu_mode 0,
+ *            set by the caller first): compiled FPU code works on
+ *            regs.fp[].fp, which SoftFloat does not use. It does not need
+ *            direct_memory: operands in memory go through the same
+ *            inline-or-handler choice as integer accesses, with double and
+ *            extended values assembled from 32-bit transfers when the
+ *            handlers are used, as in WinUAE.
  */
 void uae_host_configure_jit(bool enabled, uint32_t cache_kb, bool follow_cacr, bool direct_memory,
                             bool jit_fpu, bool honour_guest_cache_flush)
@@ -516,8 +517,7 @@ void uae_host_configure_jit(bool enabled, uint32_t cache_kb, bool follow_cacr, b
     changed_prefs.comptrustbyte = changed_prefs.comptrustword = direct_memory ? 0 : 1;
     changed_prefs.comptrustlong = changed_prefs.comptrustnaddr = direct_memory ? 0 : 1;
     changed_prefs.compnf = true;
-    changed_prefs.compfpu = jit_fpu && direct_memory && want && currprefs.fpu_model &&
-                            currprefs.fpu_mode == 0;
+    changed_prefs.compfpu = jit_fpu && want && currprefs.fpu_model && currprefs.fpu_mode == 0;
     changed_prefs.comp_hardflush = false;
     changed_prefs.comp_constjump = true;
     changed_prefs.fpu_strict = currprefs.fpu_strict;
