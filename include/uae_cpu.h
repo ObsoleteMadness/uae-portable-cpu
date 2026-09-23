@@ -310,9 +310,11 @@ void     uae_cpu_invalidate_code(uae_cpu_t *cpu, uint32_t addr, uint32_t size);
  * window must cover every address translated code can reach (typically one
  * 4 GB reservation with RAM, ROM and video memory committed in place). If
  * such an access faults in an uncommitted part of the window, the x86-64
- * and Windows ARM64 JITs recover and complete it through the region's
- * handler; on AArch64 Linux and macOS the fault reaches the host's
- * SIGSEGV/SIGBUS handler.
+ * and ARM64 JITs recover and complete it through the region's handler (on
+ * ARM64, integer loads and stores only; anything else reaches the host's
+ * SIGSEGV/SIGBUS handler). Commit ROM read-only: an inlined store that first
+ * hit RAM and later reaches ROM then faults and is dropped, rather than
+ * patching the ROM.
  */
 int      uae_cpu_set_jit_memory_base(uae_cpu_t *cpu, uint8_t *base);
 

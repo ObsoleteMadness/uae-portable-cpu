@@ -525,9 +525,9 @@ static void run_until(uint32_t pc)
  *   - a region flagged UAE_MEM_JIT_DIRECT whose host pointer is outside the
  *     JIT window must still be read through its handler;
  *   - a device read by a loop is called once per access;
- *   - x86-64 and Windows ARM64 (the JITs with fault recovery): a translated
- *     read profiled against RAM that later hits the device faults in the
- *     window and is completed through the handler.
+ *   - x86-64 and ARM64 (the JITs with fault recovery): a translated read
+ *     profiled against RAM that later hits the device faults in the window
+ *     and is completed through the handler.
  */
 static void test_direct_memory(void)
 {
@@ -578,7 +578,7 @@ static void test_direct_memory(void)
     CHECK((reg(UAE_REG_D2) & 0xFFFF) == ((0x4000 * 0x0102) & 0xFFFF));
     uae_cpu_unmap_memory(s_cpu, DEVICE_ADDR, 0x10000);
 
-#if defined(__x86_64__) || defined(_M_X64) || (defined(_WIN32) && defined(_M_ARM64))
+#if defined(__x86_64__) || defined(_M_X64) || defined(__aarch64__) || defined(_M_ARM64)
     printf("[*] translated RAM read moved onto a device (fault recovery)\n");
     boot(UAE_CPU_TYPE_68020, ram_then_device, sizeof(ram_then_device) / sizeof(ram_then_device[0]));
     uae_cpu_map_custom(s_cpu, DEVICE_ADDR, 0x10000, cnt_r8, cnt_r16, cnt_r32,
@@ -593,6 +593,100 @@ static void test_direct_memory(void)
 #else
     (void)ram_then_device;
 #endif
+}
+
+#define ROM_ADDR 0x300000
+#define ROM_SIZE 0x10000
+
+/*
+ * Maps a ROM region at ROM_ADDR filled with a known pattern. Under
+ * jit_direct_memory it lives in the JIT window and is read-only on the host,
+ * which is what a direct-memory host has to do for guest ROM writes to be
+ * caught; otherwise it is an ordinary buffer reached through the handlers.
+ *
+ * Returns:
+ *   Host pointer to the ROM bytes, or NULL if the pages could not be set up.
+ */
+static uint8_t *map_test_rom(void)
+{
+    static uint8_t rom_buf[ROM_SIZE];
+    uint8_t *rom = s_jit_direct ? s_ram + ROM_ADDR : rom_buf;
+
+#if defined(_WIN32)
+    DWORD old;
+    if (s_jit_direct && !VirtualAlloc(rom, ROM_SIZE, MEM_COMMIT, PAGE_READWRITE))
+        return NULL;
+#else
+    if (s_jit_direct && mprotect(rom, ROM_SIZE, PROT_READ | PROT_WRITE) != 0)
+        return NULL;
+#endif
+    for (uint32_t i = 0; i < ROM_SIZE; i++)
+        rom[i] = (uint8_t)(i * 13 + 5);
+#if defined(_WIN32)
+    if (s_jit_direct && !VirtualProtect(rom, ROM_SIZE, PAGE_READONLY, &old))
+        return NULL;
+#else
+    if (s_jit_direct && mprotect(rom, ROM_SIZE, PROT_READ) != 0)
+        return NULL;
+#endif
+    uae_cpu_map_memory(s_cpu, ROM_ADDR, ROM_SIZE, rom, UAE_MEM_ROM | UAE_MEM_JIT_DIRECT);
+    return rom;
+}
+
+/* Unmaps the ROM from map_test_rom() and returns its window pages to no access. */
+static void unmap_test_rom(uint8_t *rom)
+{
+    uae_cpu_unmap_memory(s_cpu, ROM_ADDR, ROM_SIZE);
+    if (!s_jit_direct)
+        return;
+#if defined(_WIN32)
+    VirtualFree(rom, ROM_SIZE, MEM_DECOMMIT);
+#else
+    mprotect(rom, ROM_SIZE, PROT_NONE);
+#endif
+}
+
+/*
+ * Guest writes to ROM are dropped, including by a translated store that
+ * profiling saw hit RAM. Under jit_direct_memory that store is compiled
+ * inline, so when the loop moves on to ROM it faults on the read-only page and
+ * the JIT's fault handler must complete it through the ROM bank, which drops
+ * it. Without that the host write either crashes (ROM read-only) or silently
+ * patches the ROM (ROM writable).
+ */
+static void test_rom_writes_dropped(void)
+{
+    /* MOVEQ #1,D7; LEA $80000,A0;
+     * outer: MOVE.L #$4000,D3;
+     * loop: MOVE.B D3,(A0); MOVE.W D3,(2,A0); MOVE.L D3,(4,A0);
+     *       SUBQ.L #1,D3; BNE loop;
+     * LEA $300000,A0; DBF D7,outer; exec return */
+    static const uint16_t code[] = {
+        0x7E01, 0x41F9, 0x0008, 0x0000, 0x263C, 0x0000, 0x4000,
+        0x1083, 0x3143, 0x0002, 0x2143, 0x0004, 0x5383, 0x66F2,
+        0x41F9, 0x0030, 0x0000, 0x51CF, 0xFFE4,
+        OP_EXEC_RETURN
+    };
+    uint8_t *rom;
+    bool rom_intact = true;
+
+    printf("[*] translated stores profiled on RAM are dropped on ROM\n");
+    boot(UAE_CPU_TYPE_68020, code, sizeof(code) / sizeof(code[0]));
+    rom = map_test_rom();
+    CHECK(rom != NULL);
+    if (!rom)
+        return;
+    run_until(0x1028);
+    CHECK(reg(UAE_REG_PC) == 0x1028);
+    CHECK((reg(UAE_REG_D7) & 0xFFFF) == 0xFFFF);
+    /* The RAM pass ran to completion: the last iteration stored D3 = 1. */
+    CHECK(s_ram[0x80000] == 1);
+    CHECK(s_ram[0x80002] == 0 && s_ram[0x80003] == 1);
+    CHECK(s_ram[0x80004] == 0 && s_ram[0x80007] == 1);
+    for (uint32_t i = 0; i < ROM_SIZE; i++)
+        rom_intact = rom_intact && rom[i] == (uint8_t)(i * 13 + 5);
+    CHECK(rom_intact);
+    unmap_test_rom(rom);
 }
 
 /*
@@ -982,6 +1076,7 @@ int main(void)
     test_mem_flags();
     test_translated_memory_loops();
     test_direct_memory();
+    test_rom_writes_dropped();
     test_fpu_backend();
     test_fpu_loop();
     test_jit_compiles();

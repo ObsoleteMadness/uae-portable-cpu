@@ -34,6 +34,14 @@
 #if defined(CPU_AARCH64) && !defined(_WIN32)
 #include <sys/mman.h>
 #endif
+#if defined(CPU_AARCH64) && (defined(__APPLE__) || defined(__linux__))
+#include <signal.h>
+#if defined(__APPLE__)
+#include <sys/ucontext.h>
+#else
+#include <ucontext.h>
+#endif
+#endif
 #if defined(CPU_AARCH64) && defined(_WIN32)
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -1014,6 +1022,48 @@ void invalidate_block(blockinfo* bi)
     remove_deps(bi);
 }
 
+/*
+ * Host fault recovery for direct JIT memory access (jit_direct_memory).
+ *
+ * Translated code accesses memory inline only where profiling saw the
+ * instruction touch a UAE_MEM_JIT_DIRECT bank, but profiling samples one
+ * execution. When the same instruction later reaches a ROM bank, a device or
+ * an unbacked page, the inline access either faults or - for ROM that the host
+ * left writable - silently writes the ROM. The fault handlers below turn the
+ * fault back into a handler access and send the block for recompilation, as
+ * the x86 JIT's exception_handler.cpp does.
+ */
+#if defined(CPU_AARCH64) && (defined(_WIN32) || defined(__APPLE__) || defined(__linux__))
+#define JIT_ARM64_FAULT_RECOVERY 1
+
+/*
+ * Invalidates the translated block whose host code contains pc, so its next
+ * entry re-profiles it and compiles the faulting access as a handler call.
+ *
+ * Arguments:
+ *   bi: Head of the active or dormant block list to search.
+ *   pc: Host address of the faulting instruction.
+ *
+ * Returns:
+ *   1 if a block was invalidated, 0 if pc is not in any block on the list.
+ */
+static int delete_trigger(blockinfo* bi, void* pc)
+{
+	while (bi) {
+		if (bi->handler && (uae_u8*)bi->direct_handler <= pc && (uae_u8*)bi->nexthandler > pc) {
+			write_log(_T("JIT: Deleted trigger (%p < %p < %p) %p\n"),
+				bi->handler, pc, bi->nexthandler, bi->pc_p);
+			invalidate_block(bi);
+			raise_in_cl_list(bi);
+			set_special(0);
+			return 1;
+		}
+		bi = bi->next;
+	}
+	return 0;
+}
+#endif
+
 #if defined(_WIN32) && defined(CPU_AARCH64)
 static void* installed_arm64_vector_handler;
 
@@ -1034,22 +1084,6 @@ static bool windows_arm64_jit_pc(uintptr pc)
 {
 	return (compiled_code && pc >= (uintptr)compiled_code && pc < (uintptr)current_compile_p) ||
 		(popallspace && pc >= (uintptr)popallspace && pc < (uintptr)(popallspace + POPALLSPACE_SIZE));
-}
-
-static int delete_trigger(blockinfo* bi, void* pc)
-{
-	while (bi) {
-		if (bi->handler && (uae_u8*)bi->direct_handler <= pc && (uae_u8*)bi->nexthandler > pc) {
-			write_log(_T("JIT: Deleted trigger (%p < %p < %p) %p\n"),
-				bi->handler, pc, bi->nexthandler, bi->pc_p);
-			invalidate_block(bi);
-			raise_in_cl_list(bi);
-			set_special(0);
-			return 1;
-		}
-		bi = bi->next;
-	}
-	return 0;
 }
 
 static int windows_arm64_exception_size(const int transfer_size)
@@ -1390,6 +1424,291 @@ static void install_windows_arm64_jit_exception_handler(void)
 		write_log(_T("JIT: Installing Windows ARM64 vectored exception handler\n"));
 		installed_arm64_vector_handler = AddVectoredExceptionHandler(0, windows_arm64_jit_exception_handler);
 	}
+}
+#endif
+
+#if defined(JIT_ARM64_FAULT_RECOVERY) && !defined(_WIN32)
+/*
+ * POSIX (macOS, Linux) ARM64 fault recovery for direct JIT memory access.
+ *
+ * Installed once direct access is on (canbang) and chained in front of the
+ * host's own SIGSEGV/SIGBUS handlers. A fault is recovered only when it comes
+ * from translated code, the faulting instruction is one of the integer
+ * load/store forms the JIT emits against R_MEMSTART, and replaying it through
+ * the bank handler cannot fault on the same host byte again:
+ *
+ *   - custom (MMIO) and dummy banks: the handler reaches the device callbacks;
+ *   - a host-backed bank whose memory is not natmem_offset + address (a
+ *     region outside the JIT window): the handler reads the real buffer;
+ *   - a store to a ROM bank: the handler drops it, as ROM writes are dropped
+ *     on the handler path. This case needs the host to map ROM read-only, or
+ *     the inline store succeeds and never faults.
+ *
+ * Anything else - including a hole the host itself backs with the faulting
+ * page, and the FPU and MOVE16 paths - is passed to the previous handler, so
+ * the host still sees faults it should turn into bus errors or crash reports.
+ */
+static struct sigaction posix_arm64_prev_sigsegv, posix_arm64_prev_sigbus;
+
+/* One decoded integer load or store. */
+struct arm64_mem_access {
+	bool store;        /* STR* rather than LDR* */
+	int size;          /* 1, 2 or 4 bytes */
+	int rt;            /* transfer register; 31 is WZR */
+	uae_u64 ea;        /* host effective address */
+};
+
+/*
+ * Returns a pointer to general register x0..x30 in a signal context.
+ *
+ * Arguments:
+ *   uc: Signal context of the faulting thread.
+ *   reg: Register number, 0..30.
+ */
+static uae_u64* posix_arm64_xreg(ucontext_t* uc, int reg)
+{
+#if defined(__APPLE__)
+	if (reg < 29)
+		return (uae_u64*)&uc->uc_mcontext->__ss.__x[reg];
+	return reg == 29 ? (uae_u64*)&uc->uc_mcontext->__ss.__fp : (uae_u64*)&uc->uc_mcontext->__ss.__lr;
+#else
+	return (uae_u64*)&uc->uc_mcontext.regs[reg];
+#endif
+}
+
+/* Returns the faulting thread's stack pointer. */
+static uae_u64 posix_arm64_sp(ucontext_t* uc)
+{
+#if defined(__APPLE__)
+	return uc->uc_mcontext->__ss.__sp;
+#else
+	return uc->uc_mcontext.sp;
+#endif
+}
+
+/* Returns the faulting thread's program counter. */
+static uae_u64 posix_arm64_pc(ucontext_t* uc)
+{
+#if defined(__APPLE__)
+	return uc->uc_mcontext->__ss.__pc;
+#else
+	return uc->uc_mcontext.pc;
+#endif
+}
+
+/* Moves the faulting thread's program counter (resume address). */
+static void posix_arm64_set_pc(ucontext_t* uc, uae_u64 pc)
+{
+#if defined(__APPLE__)
+	uc->uc_mcontext->__ss.__pc = pc;
+#else
+	uc->uc_mcontext.pc = pc;
+#endif
+}
+
+/* Reads register n as a data register (31 is XZR). */
+static uae_u64 posix_arm64_reg_or_zero(ucontext_t* uc, int n)
+{
+	return n == 31 ? 0 : *posix_arm64_xreg(uc, n);
+}
+
+/*
+ * Decodes the integer load/store forms the JIT uses for inline memory access
+ * (LDR/STR of bytes, halfwords and words with a register offset, a scaled
+ * unsigned immediate or an unscaled signed immediate) and computes the host
+ * address they access.
+ *
+ * Arguments:
+ *   insn: The faulting A64 instruction word.
+ *   uc: Signal context, for the base and index registers.
+ *   out: Receives the decoded access.
+ *
+ * Returns:
+ *   true if insn is one of those forms. Sign-extending loads, 64-bit and
+ *   SIMD/FP transfers, pairs and pre/post-indexed forms return false.
+ */
+static bool arm64_decode_mem_access(uae_u32 insn, ucontext_t* uc, arm64_mem_access* out)
+{
+	const int size_bits = (int)(insn >> 30);
+	const int rn = (int)((insn >> 5) & 31);
+	uae_u64 offset;
+
+	/* Bits 31:30 give the size; 64-bit (3) transfers are never emitted for guest data. */
+	if (size_bits == 3)
+		return false;
+
+	switch (insn & 0x3fe00c00) {
+	case 0x38200800: /* STRB/STRH/STR (register) */
+	case 0x38600800: /* LDRB/LDRH/LDR (register) */
+	{
+		const int rm = (int)((insn >> 16) & 31);
+		const int option = (int)((insn >> 13) & 7);
+		const int shift = (insn & (1u << 12)) ? size_bits : 0;
+		const uae_u64 index = posix_arm64_reg_or_zero(uc, rm);
+		switch (option) {
+		case 2: offset = (uae_u64)(uae_u32)index << shift; break;           /* UXTW */
+		case 3: offset = index << shift; break;                              /* LSL / UXTX */
+		case 6: offset = (uae_u64)((uae_s64)(uae_s32)(uae_u32)index << shift); break; /* SXTW */
+		case 7: offset = (uae_u64)((uae_s64)index << shift); break;          /* SXTX */
+		default: return false;
+		}
+		out->store = (insn & 0x3fe00c00) == 0x38200800;
+		break;
+	}
+	case 0x38000000: /* STURB/STURH/STUR */
+	case 0x38400000: /* LDURB/LDURH/LDUR */
+	{
+		const uae_s64 imm9 = ((uae_s64)(uae_s32)(insn << 11)) >> 23;
+		offset = (uae_u64)imm9;
+		out->store = (insn & 0x3fe00c00) == 0x38000000;
+		break;
+	}
+	default:
+		switch (insn & 0x3fc00000) {
+		case 0x39000000: /* STRB/STRH/STR (unsigned immediate) */
+		case 0x39400000: /* LDRB/LDRH/LDR (unsigned immediate) */
+			offset = (uae_u64)((insn >> 10) & 0xfff) << size_bits;
+			out->store = (insn & 0x3fc00000) == 0x39000000;
+			break;
+		default:
+			return false;
+		}
+		break;
+	}
+
+	out->size = 1 << size_bits;
+	out->rt = (int)(insn & 31);
+	/* Register 31 as a base is SP, not XZR. */
+	out->ea = (rn == 31 ? posix_arm64_sp(uc) : *posix_arm64_xreg(uc, rn)) + offset;
+	return true;
+}
+
+/* True when pc lies in translated code or the popall stubs. */
+static bool posix_arm64_jit_pc(uintptr pc)
+{
+	return (compiled_code && pc >= (uintptr)compiled_code && pc < (uintptr)current_compile_p) ||
+		(popallspace && pc >= (uintptr)popallspace && pc < (uintptr)(popallspace + POPALLSPACE_SIZE));
+}
+
+/*
+ * Completes a faulting direct access from translated code through the bank
+ * handlers, then resumes after it with the block sent for recompilation.
+ *
+ * Arguments:
+ *   fault_addr: Host address from siginfo.
+ *   uc: Signal context of the faulting thread; updated on success.
+ *
+ * Returns:
+ *   true if the access was completed and execution may resume.
+ */
+static bool posix_arm64_jit_recover(uintptr fault_addr, ucontext_t* uc)
+{
+	arm64_mem_access acc;
+
+	if (!canbang || currprefs.cachesize == 0 || !natmem_offset)
+		return false;
+	const uintptr pc = (uintptr)posix_arm64_pc(uc);
+	if (!posix_arm64_jit_pc(pc))
+		return false;
+	if (!arm64_decode_mem_access(*(uae_u32*)pc, uc, &acc))
+		return false;
+	/* The fault must be this access: an unaligned one may report any of its bytes. */
+	if (fault_addr < acc.ea || fault_addr >= acc.ea + (uae_u64)acc.size)
+		return false;
+	const uae_u64 guest_wide = acc.ea - (uae_u64)(uintptr)natmem_offset;
+	if (guest_wide > 0xffffffffULL)
+		return false;
+	const uaecptr addr = (uaecptr)guest_wide;
+
+	/* Replaying must not land on the same unusable host byte. */
+	addrbank* ab = &get_mem_bank(addr);
+	if ((ab->flags & ABFLAG_RAM) && ab->baseaddr &&
+		ab->baseaddr + (addr - ab->start) == natmem_offset + addr &&
+		!(acc.store && (ab->flags & ABFLAG_ROM)))
+		return false;
+
+	/* Compiled-code register state: region handlers must not unwind. */
+	g_jit_in_fault_recovery = true;
+	if (acc.store) {
+		/* The register holds the value already byte-swapped for a big-endian store. */
+		const uae_u32 v = (uae_u32)posix_arm64_reg_or_zero(uc, acc.rt);
+		switch (acc.size) {
+		case 1: put_byte_jit(addr, v & 0xff); break;
+		case 2: put_word_jit(addr, do_byteswap_16((uae_u16)v)); break;
+		default: put_long_jit(addr, do_byteswap_32(v)); break;
+		}
+	} else {
+		/* Hand back raw big-endian bytes, as the inline load would have. */
+		uae_u32 v;
+		switch (acc.size) {
+		case 1: v = (uae_u8)get_byte_jit(addr); break;
+		case 2: v = do_byteswap_16((uae_u16)get_word_jit(addr)); break;
+		default: v = do_byteswap_32(get_long_jit(addr)); break;
+		}
+		/* A W-register write clears the upper half of the X register. */
+		if (acc.rt != 31)
+			*posix_arm64_xreg(uc, acc.rt) = v;
+	}
+	g_jit_in_fault_recovery = false;
+
+	posix_arm64_set_pc(uc, pc + 4);
+	countdown = 0;
+	set_special(SPCFLAG_END_COMPILE);
+	/* Recompile the block so the access is profiled again, now against this bank. */
+	if (!delete_trigger(active, (void*)pc) && !delete_trigger(dormant, (void*)pc))
+		set_special(0);
+	return true;
+}
+
+/*
+ * Passes a fault this handler does not own to the handler installed before
+ * it. With none, the default action is restored and the handler returns, so
+ * the faulting instruction runs again and terminates the process as it would
+ * have without the JIT.
+ */
+static void posix_arm64_chain_signal(int signum, siginfo_t* info, void* context)
+{
+	struct sigaction* prev = signum == SIGBUS ? &posix_arm64_prev_sigbus : &posix_arm64_prev_sigsegv;
+
+	if (prev->sa_flags & SA_SIGINFO) {
+		if (prev->sa_sigaction) {
+			prev->sa_sigaction(signum, info, context);
+			return;
+		}
+	} else if (prev->sa_handler != SIG_DFL && prev->sa_handler != SIG_IGN) {
+		prev->sa_handler(signum);
+		return;
+	}
+	signal(signum, SIG_DFL);
+}
+
+/* SIGSEGV/SIGBUS entry point. */
+static void posix_arm64_jit_fault(int signum, siginfo_t* info, void* context)
+{
+	if (posix_arm64_jit_recover((uintptr)info->si_addr, (ucontext_t*)context))
+		return;
+	posix_arm64_chain_signal(signum, info, context);
+}
+
+/*
+ * Installs the fault handler once per process, when direct access is on.
+ * macOS reports a write to a read-only mapping as SIGBUS, Linux as SIGSEGV.
+ */
+static void install_posix_arm64_jit_fault_handler(void)
+{
+	static bool installed;
+	struct sigaction act;
+
+	if (!canbang || installed)
+		return;
+	installed = true;
+	write_log(_T("JIT: Installing ARM64 fault handler for direct memory access\n"));
+	memset(&act, 0, sizeof(act));
+	act.sa_sigaction = posix_arm64_jit_fault;
+	sigemptyset(&act.sa_mask);
+	act.sa_flags = SA_SIGINFO;
+	sigaction(SIGSEGV, &act, &posix_arm64_prev_sigsegv);
+	sigaction(SIGBUS, &act, &posix_arm64_prev_sigbus);
 }
 #endif
 
@@ -3686,6 +4005,11 @@ void build_comp(void)
 
     regs.mem_banks = (uintptr)mem_banks;
     regs.cache_tags = (uintptr)cache_tags;
+
+#if defined(JIT_ARM64_FAULT_RECOVERY) && !defined(_WIN32)
+    /* Direct access needs a way back from accesses profiling got wrong. */
+    install_posix_arm64_jit_fault_handler();
+#endif
 
     jit_log("<JIT compiler> : building compiler function tables");
 
