@@ -9,6 +9,13 @@ option(BUILD_SHARED_LIBS "Build shared libraries" OFF)
 option(ENABLE_TESTS "Build tests" ON)
 option(UAE_CPU_MUSASHI_API "Build the Musashi-compatible m68k_* API (include/m68k.h)" ON)
 option(UAE_CPU_ISOLATE_SYMBOLS "Also build uaecpu_isolated, a static library exporting only the public API" OFF)
+# lld-link cannot link relocatably, so Windows clang isolates by renaming instead (see below)
+if(WIN32 AND CMAKE_C_COMPILER_ID MATCHES "Clang" AND NOT MSVC)
+    set(UAE_CPU_ISOLATE_BY_RENAME_DEFAULT ON)
+else()
+    set(UAE_CPU_ISOLATE_BY_RENAME_DEFAULT OFF)
+endif()
+option(UAE_CPU_ISOLATE_BY_RENAME "Isolate symbols by renaming the archive's internals instead of a relocatable link" ${UAE_CPU_ISOLATE_BY_RENAME_DEFAULT})
 set(UAE_CPU_JIT "AUTO" CACHE STRING "Build the 680x0 JIT compiler: AUTO (on for supported hosts), ON or OFF")
 set_property(CACHE UAE_CPU_JIT PROPERTY STRINGS AUTO ON OFF)
 
@@ -177,7 +184,44 @@ if(UAE_CPU_ISOLATE_SYMBOLS)
     set(UAECPU_ISOLATED_OBJ ${CMAKE_CURRENT_BINARY_DIR}/uaecpu_isolated${CMAKE_C_OUTPUT_EXTENSION})
     set(UAECPU_EXPORTS_FILE ${CMAKE_CURRENT_BINARY_DIR}/uaecpu_exports.txt)
     set(UAECPU_EXPORTS "")
-    if(APPLE)
+    if(UAE_CPU_ISOLATE_BY_RENAME)
+        # No relocatable link: rename every internal global in a copy of the
+        # archive (cmake/isolate_by_rename.cmake), so the result is an archive
+        # rather than one object and is used as an imported library.
+        if(NOT CMAKE_NM OR NOT CMAKE_OBJCOPY)
+            message(FATAL_ERROR "UAE_CPU_ISOLATE_BY_RENAME needs nm and objcopy (CMAKE_NM, CMAKE_OBJCOPY)")
+        endif()
+        set(UAECPU_EXPORT_REGEX "")
+        foreach(pattern ${UAE_CPU_EXPORT_PATTERNS})
+            string(REPLACE "*" ".*" pattern_regex "${pattern}")
+            if(UAECPU_EXPORT_REGEX)
+                string(APPEND UAECPU_EXPORT_REGEX "|")
+            endif()
+            string(APPEND UAECPU_EXPORT_REGEX "^${pattern_regex}$")
+        endforeach()
+        set(UAECPU_ISOLATED_LIB
+            ${CMAKE_CURRENT_BINARY_DIR}/${CMAKE_STATIC_LIBRARY_PREFIX}uaecpu_isolated${CMAKE_STATIC_LIBRARY_SUFFIX})
+        add_custom_command(
+            OUTPUT ${UAECPU_ISOLATED_LIB}
+            COMMAND ${CMAKE_COMMAND}
+                    -DNM=${CMAKE_NM} -DOBJCOPY=${CMAKE_OBJCOPY}
+                    -DIN_LIB=$<TARGET_FILE:uaecpu> -DOUT_LIB=${UAECPU_ISOLATED_LIB}
+                    -DMAP=${CMAKE_CURRENT_BINARY_DIR}/uaecpu_isolated_renames.txt
+                    "-DEXPORT_REGEX=${UAECPU_EXPORT_REGEX}" -DPREFIX=uaecpu_internal_
+                    -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/isolate_by_rename.cmake
+            DEPENDS uaecpu ${CMAKE_CURRENT_SOURCE_DIR}/cmake/isolate_by_rename.cmake
+            COMMENT "Renaming uaecpu internals (public API only)"
+            VERBATIM
+        )
+        add_custom_target(uaecpu_isolated_archive DEPENDS ${UAECPU_ISOLATED_LIB})
+        add_library(uaecpu_isolated STATIC IMPORTED GLOBAL)
+        set_target_properties(uaecpu_isolated PROPERTIES IMPORTED_LOCATION ${UAECPU_ISOLATED_LIB})
+        add_dependencies(uaecpu_isolated uaecpu_isolated_archive)
+        target_include_directories(uaecpu_isolated INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+        target_link_libraries(uaecpu_isolated INTERFACE m)
+        add_library(uae-portable-cpu::uaecpu_isolated ALIAS uaecpu_isolated)
+        install(FILES ${UAECPU_ISOLATED_LIB} DESTINATION ${CMAKE_INSTALL_LIBDIR})
+    elseif(APPLE)
         list(LENGTH CMAKE_OSX_ARCHITECTURES UAECPU_ARCH_COUNT)
         if(UAECPU_ARCH_COUNT GREATER 1)
             message(FATAL_ERROR "UAE_CPU_ISOLATE_SYMBOLS supports one architecture per build (CMAKE_OSX_ARCHITECTURES=${CMAKE_OSX_ARCHITECTURES})")
@@ -218,8 +262,10 @@ if(UAE_CPU_ISOLATE_SYMBOLS)
             COMMENT "Linking uaecpu_isolated (public API only)"
         )
     else()
-        message(FATAL_ERROR "UAE_CPU_ISOLATE_SYMBOLS needs Apple ld, or GNU ld with objcopy")
+        message(FATAL_ERROR "UAE_CPU_ISOLATE_SYMBOLS needs Apple ld, GNU ld with objcopy, or UAE_CPU_ISOLATE_BY_RENAME")
     endif()
+endif()
+if(UAE_CPU_ISOLATE_SYMBOLS AND NOT UAE_CPU_ISOLATE_BY_RENAME)
     set_source_files_properties(${UAECPU_ISOLATED_OBJ} PROPERTIES EXTERNAL_OBJECT TRUE GENERATED TRUE)
     add_library(uaecpu_isolated STATIC ${UAECPU_ISOLATED_OBJ})
     add_library(uae-portable-cpu::uaecpu_isolated ALIAS uaecpu_isolated)
