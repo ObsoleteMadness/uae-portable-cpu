@@ -4585,6 +4585,24 @@ void alloc_cache(void)
 	}
 }
 
+/*
+ * Checksums the guest code a block was translated from, so a lazy flush can
+ * tell unchanged code (reactivate the translation) from changed code
+ * (recompile it).
+ *
+ * c1 is a plain sum of the 32-bit words. c2 used to be their XOR, which is
+ * blind to position as well: moving a byte value from one word to the same
+ * byte lane of another (00/01 in one word becoming 01/00 in the next, as a
+ * flag toggling between two records does) leaves both the sum and the XOR
+ * unchanged, and the stale translation was reactivated. Mac OS hits this
+ * often enough to crash - opening the Monitors control panel returned into
+ * the OS trap table. c2 is now an FNV-1a style running hash, which depends on
+ * where each word sits.
+ *
+ * Arguments:
+ *   bi: Block whose checksum ranges (bi->csi) are hashed.
+ *   c1, c2: Receive the two checksum words.
+ */
 static void calc_checksum(blockinfo* bi, uae_u32* c1, uae_u32* c2)
 {
 	uae_u32 k1 = 0;
@@ -4609,7 +4627,7 @@ static void calc_checksum(blockinfo* bi, uae_u32* c1, uae_u32* c2)
 		if (len >= 0 && len <= MAX_CHECKSUM_LEN) {
 			while (len > 0) {
 				k1 += *pos;
-				k2 ^= *pos;
+				k2 = (k2 ^ *pos) * 0x01000193;
 				pos++;
 				len -= 4;
 			}

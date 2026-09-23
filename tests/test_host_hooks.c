@@ -1023,6 +1023,51 @@ static void test_guest_cache_flush(void)
         CHECK(uae_cpu_get_jit_code_size(s_cpu) > 0);
 }
 
+/*
+ * A code change that the old block checksum could not see.
+ *
+ * The patch moves a 01 byte from one 32-bit word of the subroutine to the
+ * same byte lane of the next (MOVEQ #1,D2 ... MOVEQ #0,D3 becomes
+ * MOVEQ #0,D2 ... MOVEQ #1,D3). The sum and the XOR of the words are both
+ * unchanged, so after the guest's CPUSHA the stale translation used to be
+ * reactivated and kept returning D2 = 1.
+ */
+static void test_guest_cache_flush_lane_swap(void)
+{
+    static const uint16_t code[] = {
+        0x7000, 0x7A00,                 /* MOVEQ #0,D0; MOVEQ #0,D5          */
+        0x323C, 0x03E7,                 /* MOVE.W #999,D1                    */
+        0x4EB9, 0x0000, 0x5000,         /* loop: JSR sub                     */
+        0xD082, 0xDA83,                 /* ADD.L D2,D0; ADD.L D3,D5          */
+        0x51C9, 0xFFF4,                 /* DBRA D1,loop                      */
+        0x11FC, 0x0000, 0x5001,         /* MOVE.B #0,($5001).W               */
+        0x11FC, 0x0001, 0x5005,         /* MOVE.B #1,($5005).W               */
+        0xF4B8,                         /* CPUSHA IC                         */
+        0x7000, 0x7A00,                 /* MOVEQ #0,D0; MOVEQ #0,D5          */
+        0x323C, 0x0009,                 /* MOVE.W #9,D1                      */
+        0x4EB9, 0x0000, 0x5000,         /* loop2: JSR sub                    */
+        0xD082, 0xDA83,                 /* ADD.L D2,D0; ADD.L D3,D5          */
+        0x51C9, 0xFFF4,                 /* DBRA D1,loop2                     */
+        OP_EXEC_RETURN
+    };
+    uae_cpu_host_hooks_t hooks;
+
+    printf("[*] guest cache flush sees a byte moved between words\n");
+    boot(UAE_CPU_TYPE_68040, code, sizeof(code) / sizeof(code[0]));
+    memset(&hooks, 0, sizeof(hooks));
+    hooks.illegal = on_illegal;
+    uae_cpu_set_host_hooks(s_cpu, &hooks);
+    w16(0x5000, 0x7401);                /* MOVEQ #1,D2 */
+    w16(0x5002, 0x4E71);                /* NOP         */
+    w16(0x5004, 0x7600);                /* MOVEQ #0,D3 */
+    w16(0x5006, 0x4E75);                /* RTS         */
+
+    run_until(0x103C);
+    CHECK(reg(UAE_REG_PC) == 0x103C);
+    CHECK(reg(UAE_REG_D0) == 0);        /* 10 passes of the patched MOVEQ #0,D2 */
+    CHECK(reg(UAE_REG_D5) == 10);       /* ... and of MOVEQ #1,D3 */
+}
+
 /* Writes a big-endian word into a host buffer that is not the JIT window. */
 static void poke16(uint8_t *p, uint32_t off, uint16_t v)
 {
@@ -1156,6 +1201,7 @@ int main(void)
     test_invalidate_code_range();
     test_invalidate_rom_code();
     test_guest_cache_flush();
+    test_guest_cache_flush_lane_swap();
     test_jump_targets();
     test_jump_unmapped();
 
