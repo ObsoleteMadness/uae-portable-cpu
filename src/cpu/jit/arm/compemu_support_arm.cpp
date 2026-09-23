@@ -34,6 +34,14 @@
 #if defined(CPU_AARCH64) && !defined(_WIN32)
 #include <sys/mman.h>
 #endif
+#if defined(CPU_AARCH64) && (defined(__APPLE__) || defined(__linux__))
+#include <signal.h>
+#if defined(__APPLE__)
+#include <sys/ucontext.h>
+#else
+#include <ucontext.h>
+#endif
+#endif
 #if defined(CPU_AARCH64) && defined(_WIN32)
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -1014,6 +1022,48 @@ void invalidate_block(blockinfo* bi)
     remove_deps(bi);
 }
 
+/*
+ * Host fault recovery for direct JIT memory access (jit_direct_memory).
+ *
+ * Translated code accesses memory inline only where profiling saw the
+ * instruction touch a UAE_MEM_JIT_DIRECT bank, but profiling samples one
+ * execution. When the same instruction later reaches a ROM bank, a device or
+ * an unbacked page, the inline access either faults or - for ROM that the host
+ * left writable - silently writes the ROM. The fault handlers below turn the
+ * fault back into a handler access and send the block for recompilation, as
+ * the x86 JIT's exception_handler.cpp does.
+ */
+#if defined(CPU_AARCH64) && (defined(_WIN32) || defined(__APPLE__) || defined(__linux__))
+#define JIT_ARM64_FAULT_RECOVERY 1
+
+/*
+ * Invalidates the translated block whose host code contains pc, so its next
+ * entry re-profiles it and compiles the faulting access as a handler call.
+ *
+ * Arguments:
+ *   bi: Head of the active or dormant block list to search.
+ *   pc: Host address of the faulting instruction.
+ *
+ * Returns:
+ *   1 if a block was invalidated, 0 if pc is not in any block on the list.
+ */
+static int delete_trigger(blockinfo* bi, void* pc)
+{
+	while (bi) {
+		if (bi->handler && (uae_u8*)bi->direct_handler <= pc && (uae_u8*)bi->nexthandler > pc) {
+			write_log(_T("JIT: Deleted trigger (%p < %p < %p) %p\n"),
+				bi->handler, pc, bi->nexthandler, bi->pc_p);
+			invalidate_block(bi);
+			raise_in_cl_list(bi);
+			set_special(0);
+			return 1;
+		}
+		bi = bi->next;
+	}
+	return 0;
+}
+#endif
+
 #if defined(_WIN32) && defined(CPU_AARCH64)
 static void* installed_arm64_vector_handler;
 
@@ -1034,22 +1084,6 @@ static bool windows_arm64_jit_pc(uintptr pc)
 {
 	return (compiled_code && pc >= (uintptr)compiled_code && pc < (uintptr)current_compile_p) ||
 		(popallspace && pc >= (uintptr)popallspace && pc < (uintptr)(popallspace + POPALLSPACE_SIZE));
-}
-
-static int delete_trigger(blockinfo* bi, void* pc)
-{
-	while (bi) {
-		if (bi->handler && (uae_u8*)bi->direct_handler <= pc && (uae_u8*)bi->nexthandler > pc) {
-			write_log(_T("JIT: Deleted trigger (%p < %p < %p) %p\n"),
-				bi->handler, pc, bi->nexthandler, bi->pc_p);
-			invalidate_block(bi);
-			raise_in_cl_list(bi);
-			set_special(0);
-			return 1;
-		}
-		bi = bi->next;
-	}
-	return 0;
 }
 
 static int windows_arm64_exception_size(const int transfer_size)
@@ -1390,6 +1424,291 @@ static void install_windows_arm64_jit_exception_handler(void)
 		write_log(_T("JIT: Installing Windows ARM64 vectored exception handler\n"));
 		installed_arm64_vector_handler = AddVectoredExceptionHandler(0, windows_arm64_jit_exception_handler);
 	}
+}
+#endif
+
+#if defined(JIT_ARM64_FAULT_RECOVERY) && !defined(_WIN32)
+/*
+ * POSIX (macOS, Linux) ARM64 fault recovery for direct JIT memory access.
+ *
+ * Installed once direct access is on (canbang) and chained in front of the
+ * host's own SIGSEGV/SIGBUS handlers. A fault is recovered only when it comes
+ * from translated code, the faulting instruction is one of the integer
+ * load/store forms the JIT emits against R_MEMSTART, and replaying it through
+ * the bank handler cannot fault on the same host byte again:
+ *
+ *   - custom (MMIO) and dummy banks: the handler reaches the device callbacks;
+ *   - a host-backed bank whose memory is not natmem_offset + address (a
+ *     region outside the JIT window): the handler reads the real buffer;
+ *   - a store to a ROM bank: the handler drops it, as ROM writes are dropped
+ *     on the handler path. This case needs the host to map ROM read-only, or
+ *     the inline store succeeds and never faults.
+ *
+ * Anything else - including a hole the host itself backs with the faulting
+ * page, and the FPU and MOVE16 paths - is passed to the previous handler, so
+ * the host still sees faults it should turn into bus errors or crash reports.
+ */
+static struct sigaction posix_arm64_prev_sigsegv, posix_arm64_prev_sigbus;
+
+/* One decoded integer load or store. */
+struct arm64_mem_access {
+	bool store;        /* STR* rather than LDR* */
+	int size;          /* 1, 2 or 4 bytes */
+	int rt;            /* transfer register; 31 is WZR */
+	uae_u64 ea;        /* host effective address */
+};
+
+/*
+ * Returns a pointer to general register x0..x30 in a signal context.
+ *
+ * Arguments:
+ *   uc: Signal context of the faulting thread.
+ *   reg: Register number, 0..30.
+ */
+static uae_u64* posix_arm64_xreg(ucontext_t* uc, int reg)
+{
+#if defined(__APPLE__)
+	if (reg < 29)
+		return (uae_u64*)&uc->uc_mcontext->__ss.__x[reg];
+	return reg == 29 ? (uae_u64*)&uc->uc_mcontext->__ss.__fp : (uae_u64*)&uc->uc_mcontext->__ss.__lr;
+#else
+	return (uae_u64*)&uc->uc_mcontext.regs[reg];
+#endif
+}
+
+/* Returns the faulting thread's stack pointer. */
+static uae_u64 posix_arm64_sp(ucontext_t* uc)
+{
+#if defined(__APPLE__)
+	return uc->uc_mcontext->__ss.__sp;
+#else
+	return uc->uc_mcontext.sp;
+#endif
+}
+
+/* Returns the faulting thread's program counter. */
+static uae_u64 posix_arm64_pc(ucontext_t* uc)
+{
+#if defined(__APPLE__)
+	return uc->uc_mcontext->__ss.__pc;
+#else
+	return uc->uc_mcontext.pc;
+#endif
+}
+
+/* Moves the faulting thread's program counter (resume address). */
+static void posix_arm64_set_pc(ucontext_t* uc, uae_u64 pc)
+{
+#if defined(__APPLE__)
+	uc->uc_mcontext->__ss.__pc = pc;
+#else
+	uc->uc_mcontext.pc = pc;
+#endif
+}
+
+/* Reads register n as a data register (31 is XZR). */
+static uae_u64 posix_arm64_reg_or_zero(ucontext_t* uc, int n)
+{
+	return n == 31 ? 0 : *posix_arm64_xreg(uc, n);
+}
+
+/*
+ * Decodes the integer load/store forms the JIT uses for inline memory access
+ * (LDR/STR of bytes, halfwords and words with a register offset, a scaled
+ * unsigned immediate or an unscaled signed immediate) and computes the host
+ * address they access.
+ *
+ * Arguments:
+ *   insn: The faulting A64 instruction word.
+ *   uc: Signal context, for the base and index registers.
+ *   out: Receives the decoded access.
+ *
+ * Returns:
+ *   true if insn is one of those forms. Sign-extending loads, 64-bit and
+ *   SIMD/FP transfers, pairs and pre/post-indexed forms return false.
+ */
+static bool arm64_decode_mem_access(uae_u32 insn, ucontext_t* uc, arm64_mem_access* out)
+{
+	const int size_bits = (int)(insn >> 30);
+	const int rn = (int)((insn >> 5) & 31);
+	uae_u64 offset;
+
+	/* Bits 31:30 give the size; 64-bit (3) transfers are never emitted for guest data. */
+	if (size_bits == 3)
+		return false;
+
+	switch (insn & 0x3fe00c00) {
+	case 0x38200800: /* STRB/STRH/STR (register) */
+	case 0x38600800: /* LDRB/LDRH/LDR (register) */
+	{
+		const int rm = (int)((insn >> 16) & 31);
+		const int option = (int)((insn >> 13) & 7);
+		const int shift = (insn & (1u << 12)) ? size_bits : 0;
+		const uae_u64 index = posix_arm64_reg_or_zero(uc, rm);
+		switch (option) {
+		case 2: offset = (uae_u64)(uae_u32)index << shift; break;           /* UXTW */
+		case 3: offset = index << shift; break;                              /* LSL / UXTX */
+		case 6: offset = (uae_u64)((uae_s64)(uae_s32)(uae_u32)index << shift); break; /* SXTW */
+		case 7: offset = (uae_u64)((uae_s64)index << shift); break;          /* SXTX */
+		default: return false;
+		}
+		out->store = (insn & 0x3fe00c00) == 0x38200800;
+		break;
+	}
+	case 0x38000000: /* STURB/STURH/STUR */
+	case 0x38400000: /* LDURB/LDURH/LDUR */
+	{
+		const uae_s64 imm9 = ((uae_s64)(uae_s32)(insn << 11)) >> 23;
+		offset = (uae_u64)imm9;
+		out->store = (insn & 0x3fe00c00) == 0x38000000;
+		break;
+	}
+	default:
+		switch (insn & 0x3fc00000) {
+		case 0x39000000: /* STRB/STRH/STR (unsigned immediate) */
+		case 0x39400000: /* LDRB/LDRH/LDR (unsigned immediate) */
+			offset = (uae_u64)((insn >> 10) & 0xfff) << size_bits;
+			out->store = (insn & 0x3fc00000) == 0x39000000;
+			break;
+		default:
+			return false;
+		}
+		break;
+	}
+
+	out->size = 1 << size_bits;
+	out->rt = (int)(insn & 31);
+	/* Register 31 as a base is SP, not XZR. */
+	out->ea = (rn == 31 ? posix_arm64_sp(uc) : *posix_arm64_xreg(uc, rn)) + offset;
+	return true;
+}
+
+/* True when pc lies in translated code or the popall stubs. */
+static bool posix_arm64_jit_pc(uintptr pc)
+{
+	return (compiled_code && pc >= (uintptr)compiled_code && pc < (uintptr)current_compile_p) ||
+		(popallspace && pc >= (uintptr)popallspace && pc < (uintptr)(popallspace + POPALLSPACE_SIZE));
+}
+
+/*
+ * Completes a faulting direct access from translated code through the bank
+ * handlers, then resumes after it with the block sent for recompilation.
+ *
+ * Arguments:
+ *   fault_addr: Host address from siginfo.
+ *   uc: Signal context of the faulting thread; updated on success.
+ *
+ * Returns:
+ *   true if the access was completed and execution may resume.
+ */
+static bool posix_arm64_jit_recover(uintptr fault_addr, ucontext_t* uc)
+{
+	arm64_mem_access acc;
+
+	if (!canbang || currprefs.cachesize == 0 || !natmem_offset)
+		return false;
+	const uintptr pc = (uintptr)posix_arm64_pc(uc);
+	if (!posix_arm64_jit_pc(pc))
+		return false;
+	if (!arm64_decode_mem_access(*(uae_u32*)pc, uc, &acc))
+		return false;
+	/* The fault must be this access: an unaligned one may report any of its bytes. */
+	if (fault_addr < acc.ea || fault_addr >= acc.ea + (uae_u64)acc.size)
+		return false;
+	const uae_u64 guest_wide = acc.ea - (uae_u64)(uintptr)natmem_offset;
+	if (guest_wide > 0xffffffffULL)
+		return false;
+	const uaecptr addr = (uaecptr)guest_wide;
+
+	/* Replaying must not land on the same unusable host byte. */
+	addrbank* ab = &get_mem_bank(addr);
+	if ((ab->flags & ABFLAG_RAM) && ab->baseaddr &&
+		ab->baseaddr + (addr - ab->start) == natmem_offset + addr &&
+		!(acc.store && (ab->flags & ABFLAG_ROM)))
+		return false;
+
+	/* Compiled-code register state: region handlers must not unwind. */
+	g_jit_in_fault_recovery = true;
+	if (acc.store) {
+		/* The register holds the value already byte-swapped for a big-endian store. */
+		const uae_u32 v = (uae_u32)posix_arm64_reg_or_zero(uc, acc.rt);
+		switch (acc.size) {
+		case 1: put_byte_jit(addr, v & 0xff); break;
+		case 2: put_word_jit(addr, do_byteswap_16((uae_u16)v)); break;
+		default: put_long_jit(addr, do_byteswap_32(v)); break;
+		}
+	} else {
+		/* Hand back raw big-endian bytes, as the inline load would have. */
+		uae_u32 v;
+		switch (acc.size) {
+		case 1: v = (uae_u8)get_byte_jit(addr); break;
+		case 2: v = do_byteswap_16((uae_u16)get_word_jit(addr)); break;
+		default: v = do_byteswap_32(get_long_jit(addr)); break;
+		}
+		/* A W-register write clears the upper half of the X register. */
+		if (acc.rt != 31)
+			*posix_arm64_xreg(uc, acc.rt) = v;
+	}
+	g_jit_in_fault_recovery = false;
+
+	posix_arm64_set_pc(uc, pc + 4);
+	countdown = 0;
+	set_special(SPCFLAG_END_COMPILE);
+	/* Recompile the block so the access is profiled again, now against this bank. */
+	if (!delete_trigger(active, (void*)pc) && !delete_trigger(dormant, (void*)pc))
+		set_special(0);
+	return true;
+}
+
+/*
+ * Passes a fault this handler does not own to the handler installed before
+ * it. With none, the default action is restored and the handler returns, so
+ * the faulting instruction runs again and terminates the process as it would
+ * have without the JIT.
+ */
+static void posix_arm64_chain_signal(int signum, siginfo_t* info, void* context)
+{
+	struct sigaction* prev = signum == SIGBUS ? &posix_arm64_prev_sigbus : &posix_arm64_prev_sigsegv;
+
+	if (prev->sa_flags & SA_SIGINFO) {
+		if (prev->sa_sigaction) {
+			prev->sa_sigaction(signum, info, context);
+			return;
+		}
+	} else if (prev->sa_handler != SIG_DFL && prev->sa_handler != SIG_IGN) {
+		prev->sa_handler(signum);
+		return;
+	}
+	signal(signum, SIG_DFL);
+}
+
+/* SIGSEGV/SIGBUS entry point. */
+static void posix_arm64_jit_fault(int signum, siginfo_t* info, void* context)
+{
+	if (posix_arm64_jit_recover((uintptr)info->si_addr, (ucontext_t*)context))
+		return;
+	posix_arm64_chain_signal(signum, info, context);
+}
+
+/*
+ * Installs the fault handler once per process, when direct access is on.
+ * macOS reports a write to a read-only mapping as SIGBUS, Linux as SIGSEGV.
+ */
+static void install_posix_arm64_jit_fault_handler(void)
+{
+	static bool installed;
+	struct sigaction act;
+
+	if (!canbang || installed)
+		return;
+	installed = true;
+	write_log(_T("JIT: Installing ARM64 fault handler for direct memory access\n"));
+	memset(&act, 0, sizeof(act));
+	act.sa_sigaction = posix_arm64_jit_fault;
+	sigemptyset(&act.sa_mask);
+	act.sa_flags = SA_SIGINFO;
+	sigaction(SIGSEGV, &act, &posix_arm64_prev_sigsegv);
+	sigaction(SIGBUS, &act, &posix_arm64_prev_sigbus);
 }
 #endif
 
@@ -2430,9 +2749,31 @@ static void fflags_into_flags_internal(void)
  * Support functions, internal                                      *
  ********************************************************************/
 
+/*
+ * Reports whether a host pointer into guest code lies in ROM.
+ *
+ * ROM blocks are not checksummed: they are parked on the dormant list, so a
+ * guest cache flush leaves them in place, and a trap in ROM does not force the
+ * block down to the interpreter. Besides the Amiga Kickstart and UAE Boot ROM,
+ * any region the host mapped with UAE_MEM_ROM counts, provided the pointer is
+ * the JIT window address of that bank's own memory.
+ *
+ * Arguments:
+ *   addr: Host address of guest code (a pc_hist location).
+ *
+ * Returns:
+ *   1 if addr is ROM, 0 otherwise.
+ */
 static inline int isinrom(uintptr addr)
 {
 #ifdef UAE
+    if (natmem_offset && addr - (uintptr)natmem_offset <= 0xffffffffULL) {
+        const uaecptr guest = (uaecptr)(addr - (uintptr)natmem_offset);
+        addrbank* ab = &get_mem_bank(guest);
+        if ((ab->flags & ABFLAG_ROM) && ab->baseaddr &&
+            (uintptr)(ab->baseaddr + (guest - ab->start)) == addr)
+            return 1;
+    }
     if (addr >= (uintptr)kickmem_bank.baseaddr &&
         addr < (uintptr)kickmem_bank.baseaddr + 8 * 65536) {
         return 1;
@@ -2984,6 +3325,30 @@ void readword(int address, int dest)
         readmem_real(address, dest, 2);
 }
 
+/*
+ * Tells the FPU compiler whether the instruction being compiled may reach
+ * memory inline through the JIT memory base.
+ *
+ * Integer accesses make this choice inside readlong()/writelong(). The FPU's
+ * double and extended transfers have inline-only code generators
+ * (raw_fp_to_double_rm and friends), so compemu_fpp_arm.cpp asks first and
+ * otherwise composes the transfer from readlong()/writelong(), which also
+ * works with the memory handlers (jit_direct_memory off).
+ *
+ * Arguments:
+ *   write: True for a store, false for a load.
+ *
+ * Returns:
+ *   True when direct access is on and profiling saw this instruction touch
+ *   only memory that may be accessed inline.
+ */
+bool jit_fpu_inline_mem(bool write)
+{
+    if (!canbang || jit_n_addr_unsafe || distrust_long())
+        return false;
+    return (special_mem & (write ? S_WRITE : S_READ)) == 0;
+}
+
 void readlong(int address, int dest)
 {
     if ((special_mem & S_READ) || distrust_long() || jit_n_addr_unsafe)
@@ -3308,6 +3673,24 @@ void alloc_cache(void)
     }
 }
 
+/*
+ * Checksums the guest code a block was translated from, so a lazy flush can
+ * tell unchanged code (reactivate the translation) from changed code
+ * (recompile it).
+ *
+ * c1 is a plain sum of the 32-bit words. c2 used to be their XOR, which is
+ * blind to position as well: moving a byte value from one word to the same
+ * byte lane of another (00/01 in one word becoming 01/00 in the next, as a
+ * flag toggling between two records does) leaves both the sum and the XOR
+ * unchanged, and the stale translation was reactivated. Mac OS hits this
+ * often enough to crash - opening the Monitors control panel returned into
+ * the OS trap table. c2 is now an FNV-1a style running hash, which depends on
+ * where each word sits.
+ *
+ * Arguments:
+ *   bi: Block whose checksum ranges (bi->csi) are hashed.
+ *   c1, c2: Receive the two checksum words.
+ */
 static void calc_checksum(blockinfo* bi, uae_u32* c1, uae_u32* c2)
 {
     uae_u32 k1 = 0;
@@ -3327,7 +3710,7 @@ static void calc_checksum(blockinfo* bi, uae_u32* c1, uae_u32* c2)
         if (len >= 0 && len <= MAX_CHECKSUM_LEN) {
             while (len > 0) {
                 k1 += *pos;
-                k2 ^= *pos;
+                k2 = (k2 ^ *pos) * 0x01000193;
                 pos++;
                 len -= 4;
             }
@@ -3687,6 +4070,11 @@ void build_comp(void)
     regs.mem_banks = (uintptr)mem_banks;
     regs.cache_tags = (uintptr)cache_tags;
 
+#if defined(JIT_ARM64_FAULT_RECOVERY) && !defined(_WIN32)
+    /* Direct access needs a way back from accesses profiling got wrong. */
+    install_posix_arm64_jit_fault_handler();
+#endif
+
     jit_log("<JIT compiler> : building compiler function tables");
 
     for (opcode = 0; opcode < 65536; opcode++) {
@@ -3918,22 +4306,17 @@ static inline void flush_icache_lazy(int v)
 }
 
 /*
- * Invalidates the translations whose source overlaps [addr, addr + length).
+ * Sends one list's blocks that overlap [start_p, start_p + length) to
+ * check_checksum (or back to execute_normal if already invalid) and parks
+ * them on the dormant list.
  *
- * Overlap is tested against every checksum range of a block, not just its
- * start, so a write into the middle of a block is caught. Matching blocks are
- * sent to check_checksum on their next entry: unchanged code is reactivated,
- * changed code is recompiled, and the rest of the cache is left alone. Safe to
- * call from a host call made by compiled code, since no emitted code is
- * discarded, only redirected.
+ * Arguments:
+ *   bi: First block of the list to scan; the list may be relinked meanwhile.
+ *   start_p: Host address of the written range.
+ *   length: Length of the written range in bytes.
  */
-void flush_icache_range(uaecptr addr, uae_u32 length)
+static void flush_icache_range_list(blockinfo* bi, uae_u8* start_p, uae_u32 length)
 {
-    if (!active || length == 0)
-        return;
-
-    uae_u8* start_p = get_real_address(addr);
-    blockinfo* bi = active;
     while (bi) {
         bool overlaps = false;
         for (checksum_info* csi = bi->csi; csi && !overlaps; csi = csi->next)
@@ -3964,6 +4347,31 @@ void flush_icache_range(uaecptr addr, uae_u32 length)
         remove_from_list(dbi);
         add_to_dormant(dbi);
     }
+}
+
+/*
+ * Invalidates the translations whose source overlaps [addr, addr + length).
+ *
+ * Overlap is tested against every checksum range of a block, not just its
+ * start, so a write into the middle of a block is caught. Matching blocks are
+ * sent to check_checksum on their next entry: unchanged code is reactivated,
+ * changed code is recompiled, and the rest of the cache is left alone. Safe to
+ * call from a host call made by compiled code, since no emitted code is
+ * discarded, only redirected.
+ *
+ * The dormant list is searched too: ROM blocks live there permanently (see
+ * isinrom()), and a host that rewrites ROM reports it through this call.
+ * Its head is taken before the active pass, which parks blocks on it.
+ */
+void flush_icache_range(uaecptr addr, uae_u32 length)
+{
+    if ((!active && !dormant) || length == 0)
+        return;
+
+    uae_u8* start_p = get_real_address(addr);
+    blockinfo* dormant_head = dormant;
+    flush_icache_range_list(active, start_p, length);
+    flush_icache_range_list(dormant_head, start_p, length);
 }
 
 int failure;
@@ -4345,9 +4753,11 @@ void compile_block(cpu_history* pc_hist, int blocklen, int totcycles)
 
         remove_from_list(bi);
         if (trace_in_rom) {
-            // No need to checksum that block trace on cache invalidation
-            free_checksum_info_chain(bi->csi);
-            bi->csi = NULL;
+            /* No need to checksum a ROM trace on cache invalidation. It keeps
+               its source ranges so a host write to ROM reported through
+               flush_icache_range() still finds it, and zero checksums make
+               that recheck recompile it. */
+            bi->c1 = bi->c2 = 0;
             add_to_dormant(bi);
         } else {
             calc_checksum(bi, &(bi->c1), &(bi->c2));

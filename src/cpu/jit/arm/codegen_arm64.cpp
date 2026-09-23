@@ -967,11 +967,31 @@ LOWFUNC(NONE,NONE,3,raw_fpowx_rr,(uae_u32 x, FW d, FR s))
 }
 LENDFUNC(NONE,NONE,3,raw_fpowx_rr,(uae_u32 x, FW d, FR s))
 
-LOWFUNC(NONE,WRITE,2,raw_fp_from_exten_mr,(RR4 adr, FR s))
+/*
+ * 68881 extended precision <-> host double.
+ *
+ * The extended format is a 32-bit word holding sign (bit 31) and a 15-bit
+ * exponent (bits 30-16, bits 15-0 zero), then a 64-bit mantissa with an
+ * explicit integer bit. The conversions work on register values so the same
+ * code serves both guest memory reached through the JIT memory base and a
+ * host buffer filled or drained through the memory handlers (see
+ * compemu_fpp_arm.cpp).
+ */
+
+/*
+ * Emits the conversion of FP register s to extended format.
+ *
+ * Arguments:
+ *   s: Native FP register holding the double.
+ *
+ * Leaves REG_WORK2 = the sign/exponent word (pad bits zero, as the
+ * interpreter writes it) and REG_WORK1 = the 64-bit mantissa. Uses
+ * REG_WORK3; REG_WORK4 is left alone for the caller's address.
+ */
+static void emit_double_to_exten(int s)
 {
 	FMOV_xd(REG_WORK1, s);
 	FCMP_d0(s);
-	ADD_xxx(REG_WORK4, adr, R_MEMSTART);
 
 	uae_u32* branchadd_iszero = (uae_u32*)get_target();
 	BEQ_i(0); // iszero
@@ -988,50 +1008,40 @@ LOWFUNC(NONE,WRITE,2,raw_fp_from_exten_mr,(RR4 adr, FR s))
 	LSL_xxi(REG_WORK3, REG_WORK3, 31);
 	ORR_xxxLSLi(REG_WORK2, REG_WORK3, REG_WORK2, 16); // merge sign and exponent
 
-	REV32_xx(REG_WORK2, REG_WORK2);
-	STRH_wXi(REG_WORK2, REG_WORK4, 0);         	// write exponent
-	ADD_xxi(REG_WORK4, REG_WORK4, 4);
-
 	LSL_xxi(REG_WORK1, REG_WORK1, 11);          // shift mantissa to correct position
-	REV_xx(REG_WORK1, REG_WORK1);
-	SET_xxbit(REG_WORK1, REG_WORK1, 7);        // insert explicit 1
-	STR_xXi(REG_WORK1, REG_WORK4, 0);
+	SET_xxbit(REG_WORK1, REG_WORK1, 63);        // insert explicit 1
 	uae_u32* branchadd_end = (uae_u32*)get_target();
 	B_i(0);            // end_of_op
 
 	// isnan
 	write_jmp_target(branchadd_isnan, (uintptr)get_target());
-	MOV_xish(REG_WORK1, 0x7fff, 16);
-	MOVN_xi(REG_WORK2, 0);
-	B_i(4);
+	MOV_xish(REG_WORK2, 0x7fff, 16);
+	MOVN_xi(REG_WORK1, 0);
+	uae_u32* branchadd_end2 = (uae_u32*)get_target();
+	B_i(0);            // end_of_op
 
 	// iszero
 	write_jmp_target(branchadd_iszero, (uintptr)get_target());
-	UBFX_xxii(REG_WORK1, REG_WORK1, 63, 1);     // extract sign
-	LSL_xxi(REG_WORK1, REG_WORK1, 31);
-	MOV_xi(REG_WORK2, 0);
-
-	REV32_xx(REG_WORK1, REG_WORK1);
-	STR_wXi(REG_WORK1, REG_WORK4, 0);
-	STP_wwXi(REG_WORK2, REG_WORK2, REG_WORK4, 4);
+	UBFX_xxii(REG_WORK2, REG_WORK1, 63, 1);     // extract sign
+	LSL_xxi(REG_WORK2, REG_WORK2, 31);
+	MOV_xi(REG_WORK1, 0);
 
 	// end_of_op
 	write_jmp_target(branchadd_end, (uintptr)get_target());
+	write_jmp_target(branchadd_end2, (uintptr)get_target());
 }
-LENDFUNC(NONE,WRITE,2,raw_fp_from_exten_mr,(RR4 adr, FR s))
 
-LOWFUNC(NONE,READ,2,raw_fp_to_exten_rm,(FW d, RR4 adr))
+/*
+ * Emits the conversion of an extended value to FP register d.
+ *
+ * Arguments:
+ *   d: Native FP register receiving the double.
+ *
+ * Expects REG_WORK1 = the 64-bit mantissa with the explicit integer bit
+ * cleared and REG_WORK4 = the 16-bit sign/exponent. Uses REG_WORK2/3.
+ */
+static void emit_exten_to_double(int d)
 {
-	ADD_xxx(REG_WORK3, adr, R_MEMSTART);
-
-	ADD_xxi(REG_WORK1, REG_WORK3, 4);
-	LDR_xXi(REG_WORK1, REG_WORK1, 0);
-	CLEAR_xxbit(REG_WORK1, REG_WORK1, 7); 	// clear explicit 1
-	REV_xx(REG_WORK1, REG_WORK1);
-
-	LDRH_wXi(REG_WORK4, REG_WORK3, 0);
-	REV16_xx(REG_WORK4, REG_WORK4);				// exponent now in lower half
-
 	ANDS_xx7fff(REG_WORK2, REG_WORK4);
 	uae_u32* branchadd_notzero = (uae_u32*)get_target();
 	BNE_i(0);				// not_zero
@@ -1064,7 +1074,70 @@ LOWFUNC(NONE,READ,2,raw_fp_to_exten_rm,(FW d, RR4 adr))
 	write_jmp_target(branchadd_end, (uintptr)get_target());
 	write_jmp_target(branchadd_end2, (uintptr)get_target());
 }
+
+/* Stores s as extended at guest address adr, through the JIT memory base. */
+LOWFUNC(NONE,WRITE,2,raw_fp_from_exten_mr,(RR4 adr, FR s))
+{
+	emit_double_to_exten(s);
+	ADD_xxx(REG_WORK4, adr, R_MEMSTART);
+	REV32_xx(REG_WORK2, REG_WORK2);
+	STR_wXi(REG_WORK2, REG_WORK4, 0);         	// sign/exponent word, big-endian
+	ADD_xxi(REG_WORK4, REG_WORK4, 4);
+	REV_xx(REG_WORK1, REG_WORK1);
+	STR_xXi(REG_WORK1, REG_WORK4, 0);         	// mantissa, big-endian
+}
+LENDFUNC(NONE,WRITE,2,raw_fp_from_exten_mr,(RR4 adr, FR s))
+
+/* Loads d from the extended value at guest address adr, through the JIT memory base. */
+LOWFUNC(NONE,READ,2,raw_fp_to_exten_rm,(FW d, RR4 adr))
+{
+	ADD_xxx(REG_WORK3, adr, R_MEMSTART);
+
+	ADD_xxi(REG_WORK1, REG_WORK3, 4);
+	LDR_xXi(REG_WORK1, REG_WORK1, 0);
+	CLEAR_xxbit(REG_WORK1, REG_WORK1, 7); 	// clear explicit 1
+	REV_xx(REG_WORK1, REG_WORK1);
+
+	LDRH_wXi(REG_WORK4, REG_WORK3, 0);
+	REV16_xx(REG_WORK4, REG_WORK4);				// exponent now in lower half
+
+	emit_exten_to_double(d);
+}
 LENDFUNC(NONE,READ,2,raw_fp_to_exten_rm,(FW d, RR4 adr))
+
+/*
+ * Stores s as extended into a host buffer of three host-order 32-bit words
+ * (sign/exponent, mantissa high, mantissa low), for the caller to write to
+ * guest memory with writelong().
+ */
+LOWFUNC(NONE,WRITE,2,raw_fp_from_exten_host,(MEMW m, FR s))
+{
+	emit_double_to_exten(s);
+	LOAD_U64(REG_WORK4, m);
+	STR_wXi(REG_WORK2, REG_WORK4, 0);
+	LSR_xxi(REG_WORK3, REG_WORK1, 32);
+	STR_wXi(REG_WORK3, REG_WORK4, 4);
+	STR_wXi(REG_WORK1, REG_WORK4, 8);
+}
+LENDFUNC(NONE,WRITE,2,raw_fp_from_exten_host,(MEMW m, FR s))
+
+/*
+ * Loads d from an extended value in a host buffer of three host-order 32-bit
+ * words, filled by the caller with readlong().
+ */
+LOWFUNC(NONE,READ,2,raw_fp_to_exten_host,(FW d, MEMR m))
+{
+	LOAD_U64(REG_WORK3, m);
+	LDR_wXi(REG_WORK4, REG_WORK3, 0);
+	UBFX_xxii(REG_WORK4, REG_WORK4, 16, 16);	// sign/exponent from the top half
+	LDR_wXi(REG_WORK1, REG_WORK3, 4);
+	LDR_wXi(REG_WORK2, REG_WORK3, 8);
+	ORR_xxxLSLi(REG_WORK1, REG_WORK2, REG_WORK1, 32);	// mantissa = high:low
+	CLEAR_xxbit(REG_WORK1, REG_WORK1, 63);		// clear explicit 1
+
+	emit_exten_to_double(d);
+}
+LENDFUNC(NONE,READ,2,raw_fp_to_exten_host,(FW d, MEMR m))
 
 LOWFUNC(NONE,WRITE,2,raw_fp_from_double_mr,(RR4 adr, FR s))
 {

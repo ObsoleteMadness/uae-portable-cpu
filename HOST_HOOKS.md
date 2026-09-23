@@ -211,7 +211,7 @@ cycle-exact, MMU and test cores always execute the loop literally.
 
 | Flag | Meaning |
 |------|---------|
-| `UAE_MEM_JIT_DIRECT` | With `jit_direct_memory`: translated code may read and write the region inline, provided its host pointer is `base + start` for the JIT memory base. Otherwise the flag has no effect |
+| `UAE_MEM_JIT_DIRECT` | With `jit_direct_memory`: translated code may read and write the region inline, provided its host pointer is `base + start` for the JIT memory base. Otherwise the flag has no effect. Combined with `UAE_MEM_ROM`, the host pages must be read-only, so that an inlined store profiled against RAM faults and is dropped instead of patching the ROM |
 | `UAE_MEM_JIT_UNSAFE_BURST` | With `jit_direct_memory`: conservative mode for memory maps where a burst (MOVEM, MOVE16) can run off a direct region. Blocks touching handler-backed memory are interpreted, and on x86-64 translated accesses use the handlers |
 
 Custom regions (`uae_cpu_map_custom`) always report `UAE_MEM_IO` and are
@@ -260,7 +260,7 @@ With `jit_enabled` (see the [README](README.md#3-jit-compiler)), every hook keep
 | `dbf_spin` | While the hook is installed, `DBF Dn` is routed to its C handler so the hook is offered; installing or removing it rebuilds the tables |
 | `exception` | Fires as in the interpreter; `fault_pc` comes from the instruction being dispatched |
 | `get_irq`, `uae_cpu_signal_irq()` | Interrupts are taken at block boundaries |
-| `uae_cpu_raise_bus_error()` | Aborts the instruction from inside translated code through the JIT's bus-error recovery. Exception: with `jit_direct_memory` on x86-64 and Windows ARM64, a handler reached through fault recovery (an inlined access that hit an inaccessible part of the window) cannot raise one, and the call is ignored |
+| `uae_cpu_raise_bus_error()` | Aborts the instruction from inside translated code through the JIT's bus-error recovery. Exception: with `jit_direct_memory` on x86-64 and ARM64, a handler reached through fault recovery (an inlined access that hit an inaccessible part of the window) cannot raise one, and the call is ignored |
 | Memory callbacks | Called for every access by default. With `jit_direct_memory`, accesses that profiling saw in `UAE_MEM_JIT_DIRECT` RAM are inlined and never reach a callback |
 | `instruction` hook | Only called for code that runs on the interpreter |
 
@@ -283,10 +283,12 @@ With `jit_enabled` (see the [README](README.md#3-jit-compiler)), every hook keep
 - Hook state is global, like the rest of the core: one CPU per process.
 - The JIT translates only from the flat window set with
   `uae_cpu_set_jit_memory_base()`. Direct memory access (`jit_direct_memory`)
-  needs that window to cover the guest address space, and recovers faults in
-  it only on x86-64 and Windows ARM64.
+  needs that window to cover the guest address space and ROM pages mapped
+  read-only. It recovers faults in the window on x86-64 and ARM64; on ARM64
+  only for integer loads and stores.
 - With `jit_direct_memory` on x86-64 the library installs a SIGSEGV (and, on
-  macOS, SIGBUS) handler the first time it builds its tables. Faults outside
+  macOS, SIGBUS) handler the first time it builds its tables; on ARM64 Linux
+  and macOS it installs both. Faults outside
   translated code are passed to the handler that was installed before it.
   On Windows (x64 and ARM64) it adds a vectored exception handler instead,
   which passes on every exception it does not handle.

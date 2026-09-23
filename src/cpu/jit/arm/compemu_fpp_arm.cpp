@@ -25,6 +25,89 @@ extern void fp_to_exten(fpdata *fpd, uae_u32 wrd1, uae_u32 wrd2, uae_u32 wrd3);
 static const int sz1[8] = { 4, 4, 12, 12, 2, 8, 1, 0 };
 static const int sz2[8] = { 4, 4, 12, 12, 2, 8, 2, 0 };
 
+/*
+ * Memory transfers of double and extended operands.
+ *
+ * With direct memory access the raw code generators read and write guest
+ * memory through the JIT memory base. Otherwise - jit_direct_memory off, or
+ * profiling saw the instruction touch memory that needs its handlers - each
+ * 32-bit word goes through readlong()/writelong(), as WinUAE's x86 FPU
+ * compiler does. Extended values are staged in a host buffer of three
+ * host-order words, since there are not enough scratch registers to hold the
+ * address and all three words at once.
+ *
+ * All of these take the guest address in S1 and use S2 and S3.
+ */
+static uae_u32 fpu_mem_tmp[3];
+
+/* Loads FP register treg from the double at the guest address in S1. */
+static void comp_fp_load_double(int treg)
+{
+	if (jit_fpu_inline_mem(false)) {
+		fp_to_double_rm(treg, S1);
+		return;
+	}
+	readlong(S1, S2);				// high word
+	mov_l_rr(S3, S1);
+	arm_ADD_l_ri(S3, 4);
+	readlong(S3, S3);				// low word
+	fmov_d_rrr(treg, S3, S2);
+}
+
+/* Stores FP register sreg as a double at the guest address in S1. */
+static void comp_fp_store_double(int sreg)
+{
+	if (jit_fpu_inline_mem(true)) {
+		fp_from_double_mr(S1, sreg);
+		return;
+	}
+	fmov_to_d_rrr(S3, S2, sreg);	// S3 = low word, S2 = high word
+	writelong(S1, S2);
+	mov_l_rr(S2, S1);
+	arm_ADD_l_ri(S2, 4);
+	writelong(S2, S3);
+}
+
+/* Loads FP register treg from the extended value at the guest address in S1. */
+static void comp_fp_load_exten(int treg)
+{
+	if (jit_fpu_inline_mem(false)) {
+		fp_to_exten_rm(treg, S1);
+		return;
+	}
+	readlong(S1, S2);
+	mov_l_mr((uintptr)&fpu_mem_tmp[0], S2);
+	mov_l_rr(S3, S1);
+	arm_ADD_l_ri(S3, 4);
+	readlong(S3, S2);
+	mov_l_mr((uintptr)&fpu_mem_tmp[1], S2);
+	mov_l_rr(S3, S1);
+	arm_ADD_l_ri(S3, 8);
+	readlong(S3, S2);
+	mov_l_mr((uintptr)&fpu_mem_tmp[2], S2);
+	fp_to_exten_host(treg, (uintptr)fpu_mem_tmp);
+}
+
+/* Stores FP register sreg as an extended value at the guest address in S1. */
+static void comp_fp_store_exten(int sreg)
+{
+	if (jit_fpu_inline_mem(true)) {
+		fp_from_exten_mr(S1, sreg);
+		return;
+	}
+	fp_from_exten_host((uintptr)fpu_mem_tmp, sreg);
+	mov_l_rm(S2, (uintptr)&fpu_mem_tmp[0]);
+	writelong(S1, S2);
+	mov_l_rr(S3, S1);
+	arm_ADD_l_ri(S3, 4);
+	mov_l_rm(S2, (uintptr)&fpu_mem_tmp[1]);
+	writelong(S3, S2);
+	mov_l_rr(S3, S1);
+	arm_ADD_l_ri(S3, 8);
+	mov_l_rm(S2, (uintptr)&fpu_mem_tmp[2]);
+	writelong(S3, S2);
+}
+
 /* return the required floating point precision or -1 for failure, 0=E, 1=S, 2=D */
 STATIC_INLINE int comp_fp_get (uae_u32 opcode, uae_u16 extra, int treg)
 {
@@ -178,14 +261,14 @@ STATIC_INLINE int comp_fp_get (uae_u32 opcode, uae_u16 extra, int treg)
 			fmov_s_rr (treg, S2);
 		return 1;
 		case 2: /* Long Double */
-		  fp_to_exten_rm (treg, S1);
+		  comp_fp_load_exten (treg);
 		  return 0;
 		case 4: /* Word */
 		readword (S1, S2);
 			fmov_w_rr (treg, S2);
 		return 1;
 		case 5: /* Double */
-		  fp_to_double_rm (treg, S1);
+		  comp_fp_load_double (treg);
 		return 2;
 		case 6: /* Byte */
 		readbyte (S1, S2);
@@ -280,14 +363,14 @@ STATIC_INLINE int comp_fp_put (uae_u32 opcode, uae_u16 extra)
 	    writelong_clobber (S1, S2);
 	    return 0;
 		case 2:/* Long Double */
-		  fp_from_exten_mr (S1, sreg);
+		  comp_fp_store_exten (sreg);
 		  return 0;
 		case 4: /* Word */
 		  fmov_to_w_rr(S2, sreg);
 		  writeword_clobber (S1, S2);
 		  return 0;
 		case 5: /* Double */
-			fp_from_double_mr(S1, sreg);
+			comp_fp_store_double (sreg);
 		  return 0;
 		case 6: /* Byte */
       fmov_to_b_rr(S2, sreg);
@@ -470,11 +553,6 @@ void comp_fpp_opp (uae_u32 opcode, uae_u16 extra)
 	int source = (extra >> 13) & 7;
 	int	opmode = extra & 0x7f;
 
-  if (special_mem) {
-    FAIL(1);
-    return;
-  }
-
 	if (!currprefs.compfpu) {
 		FAIL (1);
 		return;
@@ -606,14 +684,14 @@ void comp_fpp_opp (uae_u32 opcode, uae_u16 extra)
 					for (reg = 7; reg >= 0; reg--) {
 						if (list & 0x80) {
 							sub_l_ri (ad, 12);
-							fp_from_exten_mr (ad, reg);
+							comp_fp_store_exten (reg);
 						}
 						list <<= 1;
 					}
 				} else { /* Postincrement */
 					for (reg = 0; reg <= 7; reg++) {
 						if (list & 0x80) {
-							fp_from_exten_mr (ad, reg);
+							comp_fp_store_exten (reg);
 							arm_ADD_l_ri (ad, 12);
 						}
 						list <<= 1;
@@ -661,14 +739,14 @@ void comp_fpp_opp (uae_u32 opcode, uae_u16 extra)
 					for (reg = 7; reg >= 0; reg--) {
 						if (list & 0x80) {
 							sub_l_ri (ad, 12);
-              fp_to_exten_rm(reg, ad);
+							comp_fp_load_exten (reg);
 						}
 						list <<= 1;
 					}
 				} else {
 					for (reg = 0; reg <= 7; reg++) {
 						if (list & 0x80) {
-              fp_to_exten_rm(reg, ad);
+							comp_fp_load_exten (reg);
 							arm_ADD_l_ri (ad, 12);
 						}
 						list <<= 1;

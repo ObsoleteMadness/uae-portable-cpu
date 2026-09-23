@@ -118,9 +118,10 @@ typedef struct {
                               * reports every code write through uae_cpu_invalidate_code() and
                               * the guest flushes often enough for it to cost */
     bool jit_fpu;            /* true = also translate FPU instructions (WinUAE "JIT FPU"). Takes
-                              * effect only with jit_enabled, jit_direct_memory, an FPU and
-                              * fpu_softfloat = false: translated FPU code works on host doubles
-                              * and moves values through the JIT memory base */
+                              * effect only with jit_enabled, an FPU and fpu_softfloat = false:
+                              * translated FPU code works on host doubles. Works with or without
+                              * jit_direct_memory; memory operands follow the same inline or
+                              * handler choice as integer accesses */
 } uae_cpu_config_t;
 
 /* Memory Read/Write Callbacks for custom mapped devices */
@@ -310,9 +311,11 @@ void     uae_cpu_invalidate_code(uae_cpu_t *cpu, uint32_t addr, uint32_t size);
  * window must cover every address translated code can reach (typically one
  * 4 GB reservation with RAM, ROM and video memory committed in place). If
  * such an access faults in an uncommitted part of the window, the x86-64
- * and Windows ARM64 JITs recover and complete it through the region's
- * handler; on AArch64 Linux and macOS the fault reaches the host's
- * SIGSEGV/SIGBUS handler.
+ * and ARM64 JITs recover and complete it through the region's handler (on
+ * ARM64, integer loads and stores only; anything else reaches the host's
+ * SIGSEGV/SIGBUS handler). Commit ROM read-only: an inlined store that first
+ * hit RAM and later reaches ROM then faults and is dropped, rather than
+ * patching the ROM.
  */
 int      uae_cpu_set_jit_memory_base(uae_cpu_t *cpu, uint8_t *base);
 

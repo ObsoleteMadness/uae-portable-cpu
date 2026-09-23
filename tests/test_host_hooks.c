@@ -525,9 +525,9 @@ static void run_until(uint32_t pc)
  *   - a region flagged UAE_MEM_JIT_DIRECT whose host pointer is outside the
  *     JIT window must still be read through its handler;
  *   - a device read by a loop is called once per access;
- *   - x86-64 and Windows ARM64 (the JITs with fault recovery): a translated
- *     read profiled against RAM that later hits the device faults in the
- *     window and is completed through the handler.
+ *   - x86-64 and ARM64 (the JITs with fault recovery): a translated read
+ *     profiled against RAM that later hits the device faults in the window
+ *     and is completed through the handler.
  */
 static void test_direct_memory(void)
 {
@@ -578,7 +578,7 @@ static void test_direct_memory(void)
     CHECK((reg(UAE_REG_D2) & 0xFFFF) == ((0x4000 * 0x0102) & 0xFFFF));
     uae_cpu_unmap_memory(s_cpu, DEVICE_ADDR, 0x10000);
 
-#if defined(__x86_64__) || defined(_M_X64) || (defined(_WIN32) && defined(_M_ARM64))
+#if defined(__x86_64__) || defined(_M_X64) || defined(__aarch64__) || defined(_M_ARM64)
     printf("[*] translated RAM read moved onto a device (fault recovery)\n");
     boot(UAE_CPU_TYPE_68020, ram_then_device, sizeof(ram_then_device) / sizeof(ram_then_device[0]));
     uae_cpu_map_custom(s_cpu, DEVICE_ADDR, 0x10000, cnt_r8, cnt_r16, cnt_r32,
@@ -593,6 +593,173 @@ static void test_direct_memory(void)
 #else
     (void)ram_then_device;
 #endif
+}
+
+#define ROM_ADDR 0x300000
+#define ROM_SIZE 0x10000
+
+/*
+ * Maps a ROM region at ROM_ADDR filled with a known pattern. Under
+ * jit_direct_memory it lives in the JIT window and is read-only on the host,
+ * which is what a direct-memory host has to do for guest ROM writes to be
+ * caught; otherwise it is an ordinary buffer reached through the handlers.
+ *
+ * Returns:
+ *   Host pointer to the ROM bytes, or NULL if the pages could not be set up.
+ */
+static uint8_t *map_test_rom(void)
+{
+    static uint8_t rom_buf[ROM_SIZE];
+    uint8_t *rom = s_jit_direct ? s_ram + ROM_ADDR : rom_buf;
+
+#if defined(_WIN32)
+    DWORD old;
+    if (s_jit_direct && !VirtualAlloc(rom, ROM_SIZE, MEM_COMMIT, PAGE_READWRITE))
+        return NULL;
+#else
+    if (s_jit_direct && mprotect(rom, ROM_SIZE, PROT_READ | PROT_WRITE) != 0)
+        return NULL;
+#endif
+    for (uint32_t i = 0; i < ROM_SIZE; i++)
+        rom[i] = (uint8_t)(i * 13 + 5);
+#if defined(_WIN32)
+    if (s_jit_direct && !VirtualProtect(rom, ROM_SIZE, PAGE_READONLY, &old))
+        return NULL;
+#else
+    if (s_jit_direct && mprotect(rom, ROM_SIZE, PROT_READ) != 0)
+        return NULL;
+#endif
+    uae_cpu_map_memory(s_cpu, ROM_ADDR, ROM_SIZE, rom, UAE_MEM_ROM | UAE_MEM_JIT_DIRECT);
+    return rom;
+}
+
+/* Unmaps the ROM from map_test_rom() and returns its window pages to no access. */
+static void unmap_test_rom(uint8_t *rom)
+{
+    uae_cpu_unmap_memory(s_cpu, ROM_ADDR, ROM_SIZE);
+    if (!s_jit_direct)
+        return;
+#if defined(_WIN32)
+    VirtualFree(rom, ROM_SIZE, MEM_DECOMMIT);
+#else
+    mprotect(rom, ROM_SIZE, PROT_NONE);
+#endif
+}
+
+/*
+ * Guest writes to ROM are dropped, including by a translated store that
+ * profiling saw hit RAM. Under jit_direct_memory that store is compiled
+ * inline, so when the loop moves on to ROM it faults on the read-only page and
+ * the JIT's fault handler must complete it through the ROM bank, which drops
+ * it. Without that the host write either crashes (ROM read-only) or silently
+ * patches the ROM (ROM writable).
+ */
+static void test_rom_writes_dropped(void)
+{
+    /* MOVEQ #1,D7; LEA $80000,A0;
+     * outer: MOVE.L #$4000,D3;
+     * loop: MOVE.B D3,(A0); MOVE.W D3,(2,A0); MOVE.L D3,(4,A0);
+     *       SUBQ.L #1,D3; BNE loop;
+     * LEA $300000,A0; DBF D7,outer; exec return */
+    static const uint16_t code[] = {
+        0x7E01, 0x41F9, 0x0008, 0x0000, 0x263C, 0x0000, 0x4000,
+        0x1083, 0x3143, 0x0002, 0x2143, 0x0004, 0x5383, 0x66F2,
+        0x41F9, 0x0030, 0x0000, 0x51CF, 0xFFE4,
+        OP_EXEC_RETURN
+    };
+    uint8_t *rom;
+    bool rom_intact = true;
+
+    printf("[*] translated stores profiled on RAM are dropped on ROM\n");
+    boot(UAE_CPU_TYPE_68020, code, sizeof(code) / sizeof(code[0]));
+    rom = map_test_rom();
+    CHECK(rom != NULL);
+    if (!rom)
+        return;
+    run_until(0x1028);
+    CHECK(reg(UAE_REG_PC) == 0x1028);
+    CHECK((reg(UAE_REG_D7) & 0xFFFF) == 0xFFFF);
+    /* The RAM pass ran to completion: the last iteration stored D3 = 1. */
+    CHECK(s_ram[0x80000] == 1);
+    CHECK(s_ram[0x80002] == 0 && s_ram[0x80003] == 1);
+    CHECK(s_ram[0x80004] == 0 && s_ram[0x80007] == 1);
+    for (uint32_t i = 0; i < ROM_SIZE; i++)
+        rom_intact = rom_intact && rom[i] == (uint8_t)(i * 13 + 5);
+    CHECK(rom_intact);
+    unmap_test_rom(rom);
+}
+
+/*
+ * Writes one big-endian word into the ROM from map_test_rom(), as a host
+ * patching ROM does, lifting the host write protection around the store.
+ */
+static void rom_poke16(uint8_t *rom, uint32_t off, uint16_t v)
+{
+#if defined(_WIN32)
+    DWORD old;
+    if (s_jit_direct)
+        VirtualProtect(rom, ROM_SIZE, PAGE_READWRITE, &old);
+#else
+    if (s_jit_direct)
+        mprotect(rom, ROM_SIZE, PROT_READ | PROT_WRITE);
+#endif
+    rom[off] = (uint8_t)(v >> 8);
+    rom[off + 1] = (uint8_t)v;
+#if defined(_WIN32)
+    if (s_jit_direct)
+        VirtualProtect(rom, ROM_SIZE, PAGE_READONLY, &old);
+#else
+    if (s_jit_direct)
+        mprotect(rom, ROM_SIZE, PROT_READ);
+#endif
+}
+
+/*
+ * Translated ROM code is not checksummed, since the guest cannot change it,
+ * but the host can: a host that patches ROM code and reports the range through
+ * uae_cpu_invalidate_code() must still see the new code run. Under
+ * jit_direct_memory the ROM sits in the JIT window and its subroutine is
+ * translated; elsewhere it runs on the interpreter and the check is trivial.
+ */
+static void test_invalidate_rom_code(void)
+{
+    /* MOVEQ #0,D0; MOVE.W #999,D1; loop: JSR $300000; ADD.L D2,D0; DBRA D1,loop */
+    static const uint16_t code[] = {
+        0x7000, 0x323C, 0x03E7,
+        0x4EB9, 0x0030, 0x0000,
+        0xD082,
+        0x51C9, 0xFFF6,
+        OP_EXEC_RETURN
+    };
+    uae_cpu_host_hooks_t hooks;
+    uint8_t *rom;
+
+    printf("[*] uae_cpu_invalidate_code: a host patch to translated ROM code\n");
+    boot(UAE_CPU_TYPE_68020, code, sizeof(code) / sizeof(code[0]));
+    memset(&hooks, 0, sizeof(hooks));
+    hooks.illegal = on_illegal;
+    uae_cpu_set_host_hooks(s_cpu, &hooks);
+    rom = map_test_rom();
+    CHECK(rom != NULL);
+    if (!rom)
+        return;
+    /* sub: MOVEQ #0,D3; MOVEQ #1,D2; RTS - patched in the middle, as before. */
+    rom_poke16(rom, 0, 0x7600);
+    rom_poke16(rom, 2, 0x7401);
+    rom_poke16(rom, 4, 0x4E75);
+    uae_cpu_invalidate_code(s_cpu, ROM_ADDR, 6);
+
+    run_until(0x1014);
+    CHECK(reg(UAE_REG_D0) == 1000);
+
+    /* MOVEQ #1,D2 becomes MOVEQ #2,D2. */
+    rom_poke16(rom, 2, 0x7402);
+    uae_cpu_invalidate_code(s_cpu, ROM_ADDR + 2, 2);
+
+    uae_cpu_set_reg(s_cpu, UAE_REG_PC, 0x1000);
+    run_until(0x1014);
+    CHECK(reg(UAE_REG_D0) == 2000);
+    unmap_test_rom(rom);
 }
 
 /*
@@ -656,9 +823,9 @@ static void test_fpu_backend(void)
  * FPU loop checked against C doubles (every value is exact in a double, so
  * all backends must agree to the bit): FADD / FMUL / FCMP / FBcc / FSUB,
  * FMOVE between registers, to memory and to integers. Runs on host doubles;
- * under UAE_TEST_JIT it runs with and without jit_fpu. With
- * jit_direct_memory the translated code must differ in size, which shows the
- * FPU instructions were compiled; without it jit_fpu must have no effect.
+ * under UAE_TEST_JIT it runs with and without jit_fpu, and with jit_fpu the
+ * translated code must differ in size, which shows the FPU instructions were
+ * compiled - with or without jit_direct_memory.
  * The reference values are doubles held across the execute calls, so on
  * AArch64 they also catch translated code clobbering the host's callee-saved
  * d8-d15.
@@ -721,17 +888,123 @@ static void test_fpu_loop(void)
     without_jit_fpu = run_fpu_loop(false);
     if (!getenv("UAE_TEST_JIT"))
         return;
-    if (s_jit_direct)
-        printf("[*] jit_fpu: the same loop with FPU instructions translated\n");
-    else
-        printf("[*] jit_fpu without jit_direct_memory changes nothing\n");
+    printf("[*] jit_fpu: the same loop with FPU instructions translated\n");
     with_jit_fpu = run_fpu_loop(true);
     CHECK(without_jit_fpu > 0);
     CHECK(with_jit_fpu > 0);
-    if (s_jit_direct)
-        CHECK(with_jit_fpu != without_jit_fpu);
-    else
-        CHECK(with_jit_fpu == without_jit_fpu);
+    CHECK(with_jit_fpu != without_jit_fpu);
+}
+
+#define FPU_MEM_COUNT 0x400
+
+/*
+ * Source doubles for run_fpu_memory(): normal values of both signs and
+ * magnitudes, plus +0 and -0. (Denormals, infinities and NaNs are left out:
+ * translated code converts through host doubles and does not reproduce the
+ * 68881's encodings of those.)
+ */
+static double fpu_mem_value(uint32_t n)
+{
+    if (n == 0)
+        return 0.0;
+    if (n == 1)
+        return -0.0;
+    double v = (double)n * 0.75 - 300.5;
+    if (n % 7 == 0)
+        v *= 1.0e200;
+    if (n % 11 == 0)
+        v /= 1.0e250;
+    return v;
+}
+
+/* Writes the 68881 extended encoding of normal or zero v, big-endian, to p. */
+static void fpu_mem_exten(double v, uint8_t *p)
+{
+    uint64_t bits, mant = 0;
+    uint32_t se;
+
+    memcpy(&bits, &v, sizeof(bits));
+    se = (uint32_t)(bits >> 63) << 31;
+    if (bits << 1) {
+        se |= (uint32_t)(((bits >> 52) & 0x7ff) + 15360) << 16;
+        mant = (bits << 11) | (1ULL << 63);
+    }
+    for (int b = 0; b < 4; b++)
+        p[b] = (uint8_t)(se >> (24 - 8 * b));
+    for (int b = 0; b < 8; b++)
+        p[4 + b] = (uint8_t)(mant >> (56 - 8 * b));
+}
+
+/*
+ * Double and extended operands in memory: FMOVE.D loads and stores,
+ * FMOVE.X stores and a (d16,An) load, and FMOVEM.X in both directions. Under
+ * the JIT these are the transfers whose code depends on jit_direct_memory:
+ * inline through the JIT memory base with it, assembled from 32-bit handler
+ * accesses without it. The results are checked bit for bit, including the
+ * zero pad word of the extended format.
+ *
+ * Returns:
+ *   Bytes of translated code afterwards.
+ */
+static uint32_t run_fpu_memory(bool jit_fpu)
+{
+    static const uint16_t code[] = {
+        0x41F9, 0x0008, 0x0000,         /* 1000 LEA $80000,A0  source doubles     */
+        0x43F9, 0x0008, 0x8000,         /* 1006 LEA $88000,A1  extended out       */
+        0x45F9, 0x0009, 0x0000,         /* 100C LEA $90000,A2  FMOVEM stack       */
+        0x47F9, 0x0009, 0x8000,         /* 1012 LEA $98000,A3  doubles out        */
+        0x363C, FPU_MEM_COUNT - 1,      /* 1018 MOVE.W #count-1,D3                */
+        0xF218, 0x5400,                 /* 101C loop: FMOVE.D (A0)+,FP0           */
+        0xF219, 0x6800,                 /* 1020 FMOVE.X FP0,(A1)+                 */
+        0xF229, 0x4880, 0xFFF4,         /* 1024 FMOVE.X (-12,A1),FP1              */
+        0xF222, 0xE003,                 /* 102A FMOVEM.X FP0-FP1,-(A2)            */
+        0xF21A, 0xD030,                 /* 102E FMOVEM.X (A2)+,FP2-FP3            */
+        0xF21B, 0x7500,                 /* 1032 FMOVE.D FP2,(A3)+                 */
+        0xF21B, 0x7580,                 /* 1036 FMOVE.D FP3,(A3)+                 */
+        0x51CB, 0xFFE0,                 /* 103A DBRA D3,loop                      */
+        OP_EXEC_RETURN                  /* 103E                                   */
+    };
+    static uint8_t want_ext[FPU_MEM_COUNT * 12];
+    static uint8_t want_dbl[FPU_MEM_COUNT * 16];
+
+    s_fpu_type = UAE_FPU_68040;
+    s_fpu_native = true;
+    s_jit_fpu = jit_fpu;
+    boot(UAE_CPU_TYPE_68040, code, sizeof(code) / sizeof(code[0]));
+    for (uint32_t n = 0; n < FPU_MEM_COUNT; n++) {
+        double v = fpu_mem_value(n);
+        uint64_t bits;
+        memcpy(&bits, &v, sizeof(bits));
+        for (int b = 0; b < 8; b++) {
+            uint8_t byte = (uint8_t)(bits >> (56 - 8 * b));
+            s_ram[0x80000 + n * 8 + b] = byte;
+            want_dbl[n * 16 + b] = byte;
+            want_dbl[n * 16 + 8 + b] = byte;
+        }
+        fpu_mem_exten(v, want_ext + n * 12);
+    }
+    run_until(0x1040);
+    CHECK(reg(UAE_REG_PC) == 0x1040);
+    CHECK(reg(UAE_REG_A2) == 0x90000);
+    CHECK(memcmp(s_ram + 0x88000, want_ext, sizeof(want_ext)) == 0);
+    CHECK(memcmp(s_ram + 0x98000, want_dbl, sizeof(want_dbl)) == 0);
+    s_jit_fpu = false;
+    s_fpu_native = false;
+    s_fpu_type = UAE_FPU_NONE;
+    return uae_cpu_get_jit_code_size(s_cpu);
+}
+
+static void test_fpu_memory(void)
+{
+    uint32_t without_jit_fpu, with_jit_fpu;
+
+    printf("[*] FPU double/extended memory operands and FMOVEM\n");
+    without_jit_fpu = run_fpu_memory(false);
+    if (!getenv("UAE_TEST_JIT"))
+        return;
+    printf("[*] the same with FPU instructions translated\n");
+    with_jit_fpu = run_fpu_memory(true);
+    CHECK(with_jit_fpu != without_jit_fpu);
 }
 
 static void test_jit_compiles(void)
@@ -854,6 +1127,51 @@ static void test_guest_cache_flush(void)
     CHECK(reg(UAE_REG_D0) == 20);       /* 10 passes of the patched MOVEQ #2 */
     if (getenv("UAE_TEST_JIT"))
         CHECK(uae_cpu_get_jit_code_size(s_cpu) > 0);
+}
+
+/*
+ * A code change that the old block checksum could not see.
+ *
+ * The patch moves a 01 byte from one 32-bit word of the subroutine to the
+ * same byte lane of the next (MOVEQ #1,D2 ... MOVEQ #0,D3 becomes
+ * MOVEQ #0,D2 ... MOVEQ #1,D3). The sum and the XOR of the words are both
+ * unchanged, so after the guest's CPUSHA the stale translation used to be
+ * reactivated and kept returning D2 = 1.
+ */
+static void test_guest_cache_flush_lane_swap(void)
+{
+    static const uint16_t code[] = {
+        0x7000, 0x7A00,                 /* MOVEQ #0,D0; MOVEQ #0,D5          */
+        0x323C, 0x03E7,                 /* MOVE.W #999,D1                    */
+        0x4EB9, 0x0000, 0x5000,         /* loop: JSR sub                     */
+        0xD082, 0xDA83,                 /* ADD.L D2,D0; ADD.L D3,D5          */
+        0x51C9, 0xFFF4,                 /* DBRA D1,loop                      */
+        0x11FC, 0x0000, 0x5001,         /* MOVE.B #0,($5001).W               */
+        0x11FC, 0x0001, 0x5005,         /* MOVE.B #1,($5005).W               */
+        0xF4B8,                         /* CPUSHA IC                         */
+        0x7000, 0x7A00,                 /* MOVEQ #0,D0; MOVEQ #0,D5          */
+        0x323C, 0x0009,                 /* MOVE.W #9,D1                      */
+        0x4EB9, 0x0000, 0x5000,         /* loop2: JSR sub                    */
+        0xD082, 0xDA83,                 /* ADD.L D2,D0; ADD.L D3,D5          */
+        0x51C9, 0xFFF4,                 /* DBRA D1,loop2                     */
+        OP_EXEC_RETURN
+    };
+    uae_cpu_host_hooks_t hooks;
+
+    printf("[*] guest cache flush sees a byte moved between words\n");
+    boot(UAE_CPU_TYPE_68040, code, sizeof(code) / sizeof(code[0]));
+    memset(&hooks, 0, sizeof(hooks));
+    hooks.illegal = on_illegal;
+    uae_cpu_set_host_hooks(s_cpu, &hooks);
+    w16(0x5000, 0x7401);                /* MOVEQ #1,D2 */
+    w16(0x5002, 0x4E71);                /* NOP         */
+    w16(0x5004, 0x7600);                /* MOVEQ #0,D3 */
+    w16(0x5006, 0x4E75);                /* RTS         */
+
+    run_until(0x103C);
+    CHECK(reg(UAE_REG_PC) == 0x103C);
+    CHECK(reg(UAE_REG_D0) == 0);        /* 10 passes of the patched MOVEQ #0,D2 */
+    CHECK(reg(UAE_REG_D5) == 10);       /* ... and of MOVEQ #1,D3 */
 }
 
 /* Writes a big-endian word into a host buffer that is not the JIT window. */
@@ -982,11 +1300,15 @@ int main(void)
     test_mem_flags();
     test_translated_memory_loops();
     test_direct_memory();
+    test_rom_writes_dropped();
     test_fpu_backend();
     test_fpu_loop();
+    test_fpu_memory();
     test_jit_compiles();
     test_invalidate_code_range();
+    test_invalidate_rom_code();
     test_guest_cache_flush();
+    test_guest_cache_flush_lane_swap();
     test_jump_targets();
     test_jump_unmapped();
 

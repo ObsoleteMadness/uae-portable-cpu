@@ -3214,9 +3214,30 @@ static void align_target(uae_u32 a)
 	}
 }
 
+/*
+ * Tells whether a host code address lies in ROM.
+ *
+ * ROM blocks are not checksummed: they are parked on the dormant list, so a
+ * guest cache flush leaves them in place. Besides the Amiga Kickstart and UAE
+ * Boot ROM, any region the host mapped with UAE_MEM_ROM counts, provided the
+ * pointer is the JIT window address of that bank's own memory.
+ *
+ * Arguments:
+ *   addr: Host address of guest code (a pc_hist location).
+ *
+ * Returns:
+ *   1 if addr is ROM, 0 otherwise.
+ */
 static inline int isinrom(uintptr addr)
 {
 #ifdef UAE
+	if (natmem_offset && addr - (uintptr)natmem_offset <= 0xffffffffULL) {
+		const uaecptr guest = (uaecptr)(addr - (uintptr)natmem_offset);
+		addrbank *ab = &get_mem_bank(guest);
+		if ((ab->flags & ABFLAG_ROM) && ab->baseaddr &&
+			(uintptr)(ab->baseaddr + (guest - ab->start)) == addr)
+			return 1;
+	}
 	if (addr >= (uintptr)kickmem_bank.baseaddr &&
 		addr < (uintptr)kickmem_bank.baseaddr + 8 * 65536) {
 		return 1;
@@ -4585,6 +4606,24 @@ void alloc_cache(void)
 	}
 }
 
+/*
+ * Checksums the guest code a block was translated from, so a lazy flush can
+ * tell unchanged code (reactivate the translation) from changed code
+ * (recompile it).
+ *
+ * c1 is a plain sum of the 32-bit words. c2 used to be their XOR, which is
+ * blind to position as well: moving a byte value from one word to the same
+ * byte lane of another (00/01 in one word becoming 01/00 in the next, as a
+ * flag toggling between two records does) leaves both the sum and the XOR
+ * unchanged, and the stale translation was reactivated. Mac OS hits this
+ * often enough to crash - opening the Monitors control panel returned into
+ * the OS trap table. c2 is now an FNV-1a style running hash, which depends on
+ * where each word sits.
+ *
+ * Arguments:
+ *   bi: Block whose checksum ranges (bi->csi) are hashed.
+ *   c1, c2: Receive the two checksum words.
+ */
 static void calc_checksum(blockinfo* bi, uae_u32* c1, uae_u32* c2)
 {
 	uae_u32 k1 = 0;
@@ -4609,7 +4648,7 @@ static void calc_checksum(blockinfo* bi, uae_u32* c1, uae_u32* c2)
 		if (len >= 0 && len <= MAX_CHECKSUM_LEN) {
 			while (len > 0) {
 				k1 += *pos;
-				k2 ^= *pos;
+				k2 = (k2 ^ *pos) * 0x01000193;
 				pos++;
 				len -= 4;
 			}
@@ -5537,22 +5576,17 @@ static void flush_icache_range(uae_u32 start, uae_u32 length)
 
 
 /*
- * Invalidates the translations whose source overlaps [addr, addr + length).
+ * Sends every block on one list whose source overlaps [start_p, start_p +
+ * length) to check_checksum (or back to execute_normal if already invalid)
+ * and parks it on the dormant list.
  *
- * Overlap is tested against every checksum range of a block, not just its
- * start, so a write into the middle of a block is caught. Matching blocks are
- * sent to check_checksum on their next entry: unchanged code is reactivated,
- * changed code is recompiled, and the rest of the cache is left alone. Safe to
- * call from a host call made by compiled code, since no emitted code is
- * discarded, only redirected.
+ * Arguments:
+ *   bi: First block of the list to scan; the list may be relinked meanwhile.
+ *   start_p: Host address of the written range.
+ *   length: Length of the written range in bytes.
  */
-void flush_icache_range(uaecptr addr, uae_u32 length)
+static void flush_icache_range_list(blockinfo *bi, uae_u8 *start_p, uae_u32 length)
 {
-	if (!active || length == 0)
-		return;
-
-	uae_u8 *start_p = get_real_address(addr);
-	blockinfo *bi = active;
 	while (bi) {
 		bool overlaps = false;
 		for (checksum_info *csi = bi->csi; csi && !overlaps; csi = csi->next)
@@ -5583,6 +5617,31 @@ void flush_icache_range(uaecptr addr, uae_u32 length)
 		remove_from_list(dbi);
 		add_to_dormant(dbi);
 	}
+}
+
+/*
+ * Invalidates the translations whose source overlaps [addr, addr + length).
+ *
+ * Overlap is tested against every checksum range of a block, not just its
+ * start, so a write into the middle of a block is caught. Matching blocks are
+ * sent to check_checksum on their next entry: unchanged code is reactivated,
+ * changed code is recompiled, and the rest of the cache is left alone. Safe to
+ * call from a host call made by compiled code, since no emitted code is
+ * discarded, only redirected.
+ *
+ * The dormant list is searched too: ROM blocks live there permanently (see
+ * isinrom()), and a host that rewrites ROM reports it through this call.
+ * Its head is taken before the active pass, which parks blocks on it.
+ */
+void flush_icache_range(uaecptr addr, uae_u32 length)
+{
+	if ((!active && !dormant) || length == 0)
+		return;
+
+	uae_u8 *start_p = get_real_address(addr);
+	blockinfo *dormant_head = dormant;
+	flush_icache_range_list(active, start_p, length);
+	flush_icache_range_list(dormant_head, start_p, length);
 }
 
 int failure;
@@ -6308,9 +6367,11 @@ static void compile_block(cpu_history* pc_hist, int blocklen)
 #if USE_CHECKSUM_INFO
 		remove_from_list(bi);
 		if (trace_in_rom) {
-			// No need to checksum that block trace on cache invalidation
-			free_checksum_info_chain(bi->csi);
-			bi->csi = NULL;
+			/* No need to checksum a ROM trace on cache invalidation. It keeps
+			   its source ranges so a host write to ROM reported through
+			   flush_icache_range() still finds it, and zero checksums make
+			   that recheck recompile it. */
+			bi->c1 = bi->c2 = 0;
 			add_to_dormant(bi);
 		}
 		else {
